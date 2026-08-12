@@ -1,3 +1,10 @@
+databases:
+  - name: calorie-bridge-db
+    plan: free
+    databaseName: calorie_bridge
+    user: calorie_bridge
+    ipAllowList: []
+
 services:
   - type: web
     name: chatgpt-calorie-bridge
@@ -5,15 +12,17 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: calorie-bridge-db
+          property: connectionString
       - key: APP_API_KEY
         generateValue: true
-      - key: PUBLIC_BASE_URL
-        sync: false
-      - key: FATSECRET_CONSUMER_KEY
-        sync: false
-      - key: FATSECRET_CONSUMER_SECRET
-        sync: false
-      - key: FATSECRET_ACCESS_TOKEN
-        sync: false
-      - key: FATSECRET_ACCESS_TOKEN_SECRET
-        sync: false
+      - key: DASHBOARD_USERNAME
+        value: andy
+      - key: DASHBOARD_PASSWORD
+        generateValue: true
+      - key: APP_TIMEZONE
+        value: America/Toronto
+      - key: DAILY_CALORIE_GOAL
+        value: "2000"
