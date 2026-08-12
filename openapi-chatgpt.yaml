@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Calorie Bridge
-  version: 1.0.0
+  version: 1.1.0
   description: Log estimated meals and retrieve daily calorie totals.
 servers:
   - url: https://YOUR-DEPLOYED-DOMAIN.example.com
@@ -35,6 +35,8 @@ paths:
     get:
       operationId: getMeals
       summary: Get logged meals
+      security:
+        - ApiKeyAuth: []
       parameters:
         - in: query
           name: day
@@ -45,6 +47,8 @@ paths:
     get:
       operationId: getDailySummary
       summary: Get daily calorie and macro totals
+      security:
+        - ApiKeyAuth: []
       parameters:
         - in: query
           name: day
