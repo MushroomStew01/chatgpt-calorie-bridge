@@ -1,5 +1,7 @@
 # ChatGPT Calorie Bridge
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2FMushroomStew01%2Fchatgpt-calorie-bridge)
+
 A small FastAPI service for the workflow:
 
 `food photo → ChatGPT estimates nutrition → API logs meal → private web dashboard updates`
@@ -18,6 +20,10 @@ A small FastAPI service for the workflow:
 - A dynamic ChatGPT Action schema at `/action-openapi.json`.
 - Optional FatSecret diary mirroring when a valid FatSecret `food_id` and `serving_id` are supplied.
 - GitHub Actions CI.
+
+## Important FatSecret limitation
+
+FatSecret `food_entry.create` requires a FatSecret food ID and serving ID. A photo-derived estimate such as “700 kcal, 35 g protein” cannot be posted as an arbitrary diary entry unless it is first mapped to a FatSecret food/serving. This project therefore always stores the ChatGPT estimate in its own database and treats FatSecret mirroring as optional.
 
 ## Local run
 
@@ -49,7 +55,7 @@ API docs are available at `http://localhost:8000/docs`.
 
 ## Deploy on Render
 
-The repository includes a Render Blueprint. In Render, create a new Blueprint and select this repository. The Blueprint creates:
+Click the **Deploy to Render** button at the top of this README. The included Blueprint creates:
 
 - a Docker web service;
 - a PostgreSQL database;
@@ -61,7 +67,7 @@ After deployment, open the web service's Environment page and copy the generated
 
 ### Render free-tier note
 
-The Blueprint currently uses Render's free web and free PostgreSQL plans for easy testing. Render free PostgreSQL databases currently expire after 30 days, so upgrade the database before expiry if you want the calorie history to remain there long-term. Do not switch the hosted deployment back to SQLite: Render web-service files are ephemeral and a SQLite calorie database can be lost on restart/redeploy.
+The Blueprint currently uses Render's free web and free PostgreSQL plans for easy testing. Render free PostgreSQL databases expire after 30 days, so upgrade the database before expiry if you want the calorie history to remain there long-term. Do not switch the hosted deployment back to SQLite: Render web-service files are ephemeral and a SQLite calorie database can be lost on restart/redeploy.
 
 ## Connect it to ChatGPT
 
