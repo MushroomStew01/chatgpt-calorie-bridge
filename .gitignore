@@ -1,0 +1,8 @@
+.env
+calories.db
+*.db
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
