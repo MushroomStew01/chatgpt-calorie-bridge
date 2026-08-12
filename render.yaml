@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: chatgpt-calorie-bridge
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: APP_API_KEY
+        generateValue: true
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: FATSECRET_CONSUMER_KEY
+        sync: false
+      - key: FATSECRET_CONSUMER_SECRET
+        sync: false
+      - key: FATSECRET_ACCESS_TOKEN
+        sync: false
+      - key: FATSECRET_ACCESS_TOKEN_SECRET
+        sync: false
