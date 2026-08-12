@@ -58,7 +58,7 @@ def test_dashboard_requires_basic_auth():
     assert client.get("/").status_code == 401
     response = client.get("/", auth=("test-user", "test-pass"))
     assert response.status_code == 200
-    assert "Calorie Bridge" in response.text
+    assert "Calorie Dashboard" in response.text
 
 
 def test_dynamic_action_schema():
