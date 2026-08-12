@@ -1,0 +1,59 @@
+openapi: 3.1.0
+info:
+  title: Calorie Bridge
+  version: 1.0.0
+  description: Log estimated meals and retrieve daily calorie totals.
+servers:
+  - url: https://YOUR-DEPLOYED-DOMAIN.example.com
+paths:
+  /api/meals:
+    post:
+      operationId: logMeal
+      summary: Log a meal with calories and macros
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, calories]
+              properties:
+                name: { type: string }
+                calories: { type: number }
+                protein: { type: number, default: 0 }
+                carbs: { type: number, default: 0 }
+                fat: { type: number, default: 0 }
+                fiber: { type: number, default: 0 }
+                sugar: { type: number, default: 0 }
+                meal_type: { type: string, enum: [breakfast, lunch, dinner, other], default: other }
+                notes: { type: string, default: "" }
+                eaten_at: { type: string, format: date-time }
+      responses:
+        "200": { description: Meal logged }
+    get:
+      operationId: getMeals
+      summary: Get logged meals
+      parameters:
+        - in: query
+          name: day
+          schema: { type: string, format: date }
+      responses:
+        "200": { description: Meals }
+  /api/summary:
+    get:
+      operationId: getDailySummary
+      summary: Get daily calorie and macro totals
+      parameters:
+        - in: query
+          name: day
+          schema: { type: string, format: date }
+      responses:
+        "200": { description: Daily summary }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
