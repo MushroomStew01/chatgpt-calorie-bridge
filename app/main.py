@@ -1,11 +1,14 @@
 import os
-from datetime import date, datetime, time, timezone
+import secrets
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
@@ -14,25 +17,45 @@ from sqlalchemy import DateTime, Float, Integer, String, create_engine, func, se
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./calories.db")
+RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./calories.db")
+if RAW_DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif RAW_DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = RAW_DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+else:
+    DATABASE_URL = RAW_DATABASE_URL
+
 APP_API_KEY = os.getenv("APP_API_KEY", "change-me")
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Toronto")
+LOCAL_TZ = ZoneInfo(APP_TIMEZONE)
+DAILY_CALORIE_GOAL = float(os.getenv("DAILY_CALORIE_GOAL", "2000"))
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "andy")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
 FATSECRET_CONSUMER_KEY = os.getenv("FATSECRET_CONSUMER_KEY", "")
 FATSECRET_CONSUMER_SECRET = os.getenv("FATSECRET_CONSUMER_SECRET", "")
 FATSECRET_ACCESS_TOKEN = os.getenv("FATSECRET_ACCESS_TOKEN", "")
 FATSECRET_ACCESS_TOKEN_SECRET = os.getenv("FATSECRET_ACCESS_TOKEN_SECRET", "")
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
 
 class Base(DeclarativeBase):
     pass
 
+
 class Meal(Base):
     __tablename__ = "meals"
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    eaten_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    eaten_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
     name: Mapped[str] = mapped_column(String(200))
     calories: Mapped[float] = mapped_column(Float)
     protein: Mapped[float] = mapped_column(Float, default=0)
@@ -46,10 +69,17 @@ class Meal(Base):
     fatsecret_serving_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     fatsecret_entry_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+
 Base.metadata.create_all(bind=engine)
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.0.0")
+
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-templates = Environment(loader=FileSystemLoader(BASE_DIR / "templates"), autoescape=select_autoescape(["html", "xml"]))
+templates = Environment(
+    loader=FileSystemLoader(BASE_DIR / "templates"),
+    autoescape=select_autoescape(["html", "xml"]),
+)
+dashboard_security = HTTPBasic(auto_error=False)
+
 
 class MealCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -66,6 +96,7 @@ class MealCreate(BaseModel):
     fatsecret_serving_id: Optional[str] = None
     fatsecret_number_of_units: float = Field(default=1.0, gt=0)
 
+
 class MealOut(BaseModel):
     id: int
     created_at: datetime
@@ -80,7 +111,9 @@ class MealOut(BaseModel):
     meal_type: str
     notes: str
     fatsecret_entry_id: Optional[str] = None
+
     model_config = {"from_attributes": True}
+
 
 def db_session():
     db = SessionLocal()
@@ -89,21 +122,75 @@ def db_session():
     finally:
         db.close()
 
+
 def require_api_key(x_api_key: str = Header(default="")):
     if not APP_API_KEY or APP_API_KEY == "change-me":
         raise HTTPException(status_code=503, detail="APP_API_KEY is not configured")
-    if x_api_key != APP_API_KEY:
+    if not secrets.compare_digest(x_api_key, APP_API_KEY):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+
+def require_dashboard_access(
+    credentials: Optional[HTTPBasicCredentials] = Depends(dashboard_security),
+) -> str:
+    if not DASHBOARD_PASSWORD:
+        raise HTTPException(status_code=503, detail="DASHBOARD_PASSWORD is not configured")
+
+    username_ok = bool(credentials) and secrets.compare_digest(
+        credentials.username, DASHBOARD_USERNAME
+    )
+    password_ok = bool(credentials) and secrets.compare_digest(
+        credentials.password, DASHBOARD_PASSWORD
+    )
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Dashboard authentication required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
 def fatsecret_ready() -> bool:
-    return all([FATSECRET_CONSUMER_KEY, FATSECRET_CONSUMER_SECRET, FATSECRET_ACCESS_TOKEN, FATSECRET_ACCESS_TOKEN_SECRET])
+    return all(
+        [
+            FATSECRET_CONSUMER_KEY,
+            FATSECRET_CONSUMER_SECRET,
+            FATSECRET_ACCESS_TOKEN,
+            FATSECRET_ACCESS_TOKEN_SECRET,
+        ]
+    )
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def to_local(dt: datetime) -> datetime:
+    return ensure_utc(dt).astimezone(LOCAL_TZ)
+
+
+def local_today() -> date:
+    return datetime.now(LOCAL_TZ).date()
+
+
+def day_bounds(day: date) -> tuple[datetime, datetime]:
+    start_local = datetime.combine(day, time.min, tzinfo=LOCAL_TZ)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
 
 def days_since_epoch(dt: datetime) -> int:
-    return (dt.date() - date(1970, 1, 1)).days
+    local_day = to_local(dt).date()
+    return (local_day - date(1970, 1, 1)).days
+
 
 def sync_to_fatsecret(meal: Meal, number_of_units: float = 1.0) -> Optional[str]:
     if not fatsecret_ready() or not meal.fatsecret_food_id or not meal.fatsecret_serving_id:
         return None
+
     auth = OAuth1(
         FATSECRET_CONSUMER_KEY,
         client_secret=FATSECRET_CONSUMER_SECRET,
@@ -120,66 +207,229 @@ def sync_to_fatsecret(meal: Meal, number_of_units: float = 1.0) -> Optional[str]
         "date": days_since_epoch(meal.eaten_at),
         "format": "json",
     }
-    response = requests.post("https://platform.fatsecret.com/rest/food-entries/v1", data=payload, auth=auth, timeout=20)
+    response = requests.post(
+        "https://platform.fatsecret.com/rest/food-entries/v1",
+        data=payload,
+        auth=auth,
+        timeout=20,
+    )
     response.raise_for_status()
     body = response.json()
     entry = body.get("food_entries", {}).get("food_entry")
     if isinstance(entry, list):
         entry = entry[0] if entry else None
-    return str(entry.get("food_entry_id")) if isinstance(entry, dict) and entry.get("food_entry_id") else None
+    return (
+        str(entry.get("food_entry_id"))
+        if isinstance(entry, dict) and entry.get("food_entry_id")
+        else None
+    )
 
-def day_bounds(day: date):
-    return datetime.combine(day, time.min, tzinfo=timezone.utc), datetime.combine(day, time.max, tzinfo=timezone.utc)
+
+def meal_query_for_day(day: date):
+    start, end = day_bounds(day)
+    return select(Meal).where(Meal.eaten_at >= start, Meal.eaten_at < end)
+
+
+def action_schema(base_url: str) -> dict:
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Calorie Bridge",
+            "version": "1.1.0",
+            "description": "Log estimated meals and retrieve daily calorie totals.",
+        },
+        "servers": [{"url": base_url.rstrip("/")}],
+        "paths": {
+            "/api/meals": {
+                "post": {
+                    "operationId": "logMeal",
+                    "summary": "Log a meal with calories and macros",
+                    "security": [{"ApiKeyAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["name", "calories"],
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "calories": {"type": "number"},
+                                        "protein": {"type": "number", "default": 0},
+                                        "carbs": {"type": "number", "default": 0},
+                                        "fat": {"type": "number", "default": 0},
+                                        "fiber": {"type": "number", "default": 0},
+                                        "sugar": {"type": "number", "default": 0},
+                                        "meal_type": {
+                                            "type": "string",
+                                            "enum": ["breakfast", "lunch", "dinner", "other"],
+                                            "default": "other",
+                                        },
+                                        "notes": {"type": "string", "default": ""},
+                                        "eaten_at": {"type": "string", "format": "date-time"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "Meal logged"}},
+                },
+                "get": {
+                    "operationId": "getMeals",
+                    "summary": "Get logged meals",
+                    "security": [{"ApiKeyAuth": []}],
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "day",
+                            "schema": {"type": "string", "format": "date"},
+                        }
+                    ],
+                    "responses": {"200": {"description": "Meals"}},
+                },
+            },
+            "/api/summary": {
+                "get": {
+                    "operationId": "getDailySummary",
+                    "summary": "Get daily calorie and macro totals",
+                    "security": [{"ApiKeyAuth": []}],
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "day",
+                            "schema": {"type": "string", "format": "date"},
+                        }
+                    ],
+                    "responses": {"200": {"description": "Daily summary"}},
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+            }
+        },
+    }
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "fatsecret_connected": fatsecret_ready()}
 
-@app.post("/api/meals", response_model=MealOut, dependencies=[Depends(require_api_key)])
+
+@app.get("/action-openapi.json", include_in_schema=False)
+def action_openapi(request: Request):
+    return JSONResponse(action_schema(str(request.base_url)))
+
+
+@app.post(
+    "/api/meals",
+    response_model=MealOut,
+    dependencies=[Depends(require_api_key)],
+)
 def create_meal(payload: MealCreate, db: Session = Depends(db_session)):
-    eaten_at = payload.eaten_at or datetime.now(timezone.utc)
-    if eaten_at.tzinfo is None:
-        eaten_at = eaten_at.replace(tzinfo=timezone.utc)
+    eaten_at = ensure_utc(payload.eaten_at or datetime.now(timezone.utc))
     meal = Meal(
-        name=payload.name, calories=payload.calories, protein=payload.protein,
-        carbs=payload.carbs, fat=payload.fat, fiber=payload.fiber, sugar=payload.sugar,
-        meal_type=payload.meal_type, notes=payload.notes, eaten_at=eaten_at,
-        fatsecret_food_id=payload.fatsecret_food_id, fatsecret_serving_id=payload.fatsecret_serving_id,
+        name=payload.name,
+        calories=payload.calories,
+        protein=payload.protein,
+        carbs=payload.carbs,
+        fat=payload.fat,
+        fiber=payload.fiber,
+        sugar=payload.sugar,
+        meal_type=payload.meal_type,
+        notes=payload.notes,
+        eaten_at=eaten_at,
+        fatsecret_food_id=payload.fatsecret_food_id,
+        fatsecret_serving_id=payload.fatsecret_serving_id,
     )
-    db.add(meal); db.commit(); db.refresh(meal)
+    db.add(meal)
+    db.commit()
+    db.refresh(meal)
+
     if payload.fatsecret_food_id and payload.fatsecret_serving_id:
         try:
-            meal.fatsecret_entry_id = sync_to_fatsecret(meal, payload.fatsecret_number_of_units)
+            meal.fatsecret_entry_id = sync_to_fatsecret(
+                meal, payload.fatsecret_number_of_units
+            )
         except Exception as exc:
-            meal.notes = (meal.notes + f" | FatSecret sync failed: {exc}").strip(" |")[:500]
-        db.commit(); db.refresh(meal)
+            meal.notes = (
+                meal.notes + f" | FatSecret sync failed: {exc}"
+            ).strip(" |")[:500]
+        db.commit()
+        db.refresh(meal)
     return meal
 
-@app.get("/api/meals", response_model=list[MealOut])
-def list_meals(day: Optional[date] = Query(default=None), db: Session = Depends(db_session)):
+
+@app.get(
+    "/api/meals",
+    response_model=list[MealOut],
+    dependencies=[Depends(require_api_key)],
+)
+def list_meals(
+    day: Optional[date] = Query(default=None), db: Session = Depends(db_session)
+):
     stmt = select(Meal).order_by(Meal.eaten_at.desc())
     if day:
         start, end = day_bounds(day)
-        stmt = stmt.where(Meal.eaten_at >= start, Meal.eaten_at <= end)
+        stmt = stmt.where(Meal.eaten_at >= start, Meal.eaten_at < end)
     return list(db.scalars(stmt).all())
 
-@app.get("/api/summary")
-def summary(day: Optional[date] = Query(default=None), db: Session = Depends(db_session)):
-    selected = day or date.today()
+
+@app.get("/api/summary", dependencies=[Depends(require_api_key)])
+def summary(
+    day: Optional[date] = Query(default=None), db: Session = Depends(db_session)
+):
+    selected = day or local_today()
     start, end = day_bounds(selected)
     stmt = select(
-        func.coalesce(func.sum(Meal.calories), 0), func.coalesce(func.sum(Meal.protein), 0),
-        func.coalesce(func.sum(Meal.carbs), 0), func.coalesce(func.sum(Meal.fat), 0), func.count(Meal.id)
-    ).where(Meal.eaten_at >= start, Meal.eaten_at <= end)
+        func.coalesce(func.sum(Meal.calories), 0),
+        func.coalesce(func.sum(Meal.protein), 0),
+        func.coalesce(func.sum(Meal.carbs), 0),
+        func.coalesce(func.sum(Meal.fat), 0),
+        func.count(Meal.id),
+    ).where(Meal.eaten_at >= start, Meal.eaten_at < end)
     calories, protein, carbs, fat, count = db.execute(stmt).one()
-    return {"date": selected.isoformat(), "meal_count": count, "calories": round(float(calories), 1),
-            "protein": round(float(protein), 1), "carbs": round(float(carbs), 1), "fat": round(float(fat), 1)}
+    calories = round(float(calories), 1)
+    return {
+        "date": selected.isoformat(),
+        "timezone": APP_TIMEZONE,
+        "meal_count": count,
+        "calories": calories,
+        "calorie_goal": DAILY_CALORIE_GOAL,
+        "calories_remaining": round(DAILY_CALORIE_GOAL - calories, 1),
+        "protein": round(float(protein), 1),
+        "carbs": round(float(carbs), 1),
+        "fat": round(float(fat), 1),
+    }
+
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, day: Optional[date] = None, db: Session = Depends(db_session)):
-    selected = day or date.today()
-    start, end = day_bounds(selected)
-    meals = list(db.scalars(select(Meal).where(Meal.eaten_at >= start, Meal.eaten_at <= end).order_by(Meal.eaten_at.desc())).all())
-    totals = {"calories": round(sum(m.calories for m in meals),1), "protein": round(sum(m.protein for m in meals),1),
-              "carbs": round(sum(m.carbs for m in meals),1), "fat": round(sum(m.fat for m in meals),1)}
-    return templates.get_template("dashboard.html").render(request=request, selected=selected, meals=meals, totals=totals, fatsecret_connected=fatsecret_ready())
+def dashboard(
+    request: Request,
+    day: Optional[date] = None,
+    db: Session = Depends(db_session),
+    _: str = Depends(require_dashboard_access),
+):
+    selected = day or local_today()
+    meals = list(
+        db.scalars(meal_query_for_day(selected).order_by(Meal.eaten_at.desc())).all()
+    )
+    calories = round(sum(m.calories for m in meals), 1)
+    totals = {
+        "calories": calories,
+        "goal": DAILY_CALORIE_GOAL,
+        "remaining": round(DAILY_CALORIE_GOAL - calories, 1),
+        "protein": round(sum(m.protein for m in meals), 1),
+        "carbs": round(sum(m.carbs for m in meals), 1),
+        "fat": round(sum(m.fat for m in meals), 1),
+    }
+    return templates.get_template("dashboard.html").render(
+        request=request,
+        selected=selected,
+        meals=meals,
+        totals=totals,
+        fatsecret_connected=fatsecret_ready(),
+        local_time=to_local,
+        timezone_name=APP_TIMEZONE,
+    )
