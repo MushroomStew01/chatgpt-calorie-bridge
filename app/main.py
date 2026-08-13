@@ -3,16 +3,17 @@ import secrets
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
-from requests_oauthlib import OAuth1
+from requests_oauthlib import OAuth1, OAuth1Session
 from sqlalchemy import DateTime, Float, Integer, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -31,11 +32,16 @@ LOCAL_TZ = ZoneInfo(APP_TIMEZONE)
 DAILY_CALORIE_GOAL = float(os.getenv("DAILY_CALORIE_GOAL", "2000"))
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "andy")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 FATSECRET_CONSUMER_KEY = os.getenv("FATSECRET_CONSUMER_KEY", "")
 FATSECRET_CONSUMER_SECRET = os.getenv("FATSECRET_CONSUMER_SECRET", "")
+# Optional legacy fallback. New connections are stored in PostgreSQL.
 FATSECRET_ACCESS_TOKEN = os.getenv("FATSECRET_ACCESS_TOKEN", "")
 FATSECRET_ACCESS_TOKEN_SECRET = os.getenv("FATSECRET_ACCESS_TOKEN_SECRET", "")
+FATSECRET_REQUEST_TOKEN_URL = "https://authentication.fatsecret.com/oauth/request_token"
+FATSECRET_AUTHORIZE_URL = "https://authentication.fatsecret.com/oauth/authorize"
+FATSECRET_ACCESS_TOKEN_URL = "https://authentication.fatsecret.com/oauth/access_token"
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
@@ -70,9 +76,22 @@ class Meal(Base):
     fatsecret_entry_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
 
+class FatSecretConnection(Base):
+    __tablename__ = "fatsecret_connection"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    request_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    request_token_secret: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    access_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    access_token_secret: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.1.0")
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.2.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -151,15 +170,31 @@ def require_dashboard_access(
     return credentials.username
 
 
-def fatsecret_ready() -> bool:
-    return all(
-        [
-            FATSECRET_CONSUMER_KEY,
-            FATSECRET_CONSUMER_SECRET,
-            FATSECRET_ACCESS_TOKEN,
-            FATSECRET_ACCESS_TOKEN_SECRET,
-        ]
-    )
+def fatsecret_keys_configured() -> bool:
+    return bool(FATSECRET_CONSUMER_KEY and FATSECRET_CONSUMER_SECRET)
+
+
+def get_fatsecret_connection(db: Session, create: bool = False) -> Optional[FatSecretConnection]:
+    connection = db.get(FatSecretConnection, 1)
+    if connection is None and create:
+        connection = FatSecretConnection(id=1)
+        db.add(connection)
+        db.commit()
+        db.refresh(connection)
+    return connection
+
+
+def fatsecret_access_credentials(db: Session) -> Optional[tuple[str, str]]:
+    connection = get_fatsecret_connection(db)
+    if connection and connection.access_token and connection.access_token_secret:
+        return connection.access_token, connection.access_token_secret
+    if FATSECRET_ACCESS_TOKEN and FATSECRET_ACCESS_TOKEN_SECRET:
+        return FATSECRET_ACCESS_TOKEN, FATSECRET_ACCESS_TOKEN_SECRET
+    return None
+
+
+def fatsecret_connected(db: Session) -> bool:
+    return fatsecret_keys_configured() and fatsecret_access_credentials(db) is not None
 
 
 def ensure_utc(dt: datetime) -> datetime:
@@ -187,15 +222,23 @@ def days_since_epoch(dt: datetime) -> int:
     return (local_day - date(1970, 1, 1)).days
 
 
-def sync_to_fatsecret(meal: Meal, number_of_units: float = 1.0) -> Optional[str]:
-    if not fatsecret_ready() or not meal.fatsecret_food_id or not meal.fatsecret_serving_id:
+def public_base_url(request: Request) -> str:
+    return PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+
+
+def sync_to_fatsecret(
+    db: Session, meal: Meal, number_of_units: float = 1.0
+) -> Optional[str]:
+    credentials = fatsecret_access_credentials(db)
+    if not credentials or not meal.fatsecret_food_id or not meal.fatsecret_serving_id:
         return None
 
+    access_token, access_token_secret = credentials
     auth = OAuth1(
         FATSECRET_CONSUMER_KEY,
         client_secret=FATSECRET_CONSUMER_SECRET,
-        resource_owner_key=FATSECRET_ACCESS_TOKEN,
-        resource_owner_secret=FATSECRET_ACCESS_TOKEN_SECRET,
+        resource_owner_key=access_token,
+        resource_owner_secret=access_token_secret,
         signature_method="HMAC-SHA1",
     )
     payload = {
@@ -235,7 +278,7 @@ def action_schema(base_url: str) -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "description": "Log estimated meals and retrieve daily calorie totals.",
         },
         "servers": [{"url": base_url.rstrip("/")}],
@@ -305,21 +348,141 @@ def action_schema(base_url: str) -> dict:
             },
         },
         "components": {
+            "schemas": {},
             "securitySchemes": {
                 "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
-            }
+            },
         },
     }
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "fatsecret_connected": fatsecret_ready()}
+def health(db: Session = Depends(db_session)):
+    return {
+        "status": "ok",
+        "fatsecret_keys_configured": fatsecret_keys_configured(),
+        "fatsecret_connected": fatsecret_connected(db),
+    }
 
 
 @app.get("/action-openapi.json", include_in_schema=False)
 def action_openapi(request: Request):
     return JSONResponse(action_schema(str(request.base_url)))
+
+
+@app.get("/fatsecret/connect", include_in_schema=False)
+def connect_fatsecret(
+    request: Request,
+    db: Session = Depends(db_session),
+    _: str = Depends(require_dashboard_access),
+):
+    if not fatsecret_keys_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Set FATSECRET_CONSUMER_KEY and FATSECRET_CONSUMER_SECRET first.",
+        )
+
+    callback_url = f"{public_base_url(request)}/fatsecret/callback"
+    oauth = OAuth1Session(
+        FATSECRET_CONSUMER_KEY,
+        client_secret=FATSECRET_CONSUMER_SECRET,
+        callback_uri=callback_url,
+    )
+    try:
+        request_token = oauth.fetch_request_token(
+            FATSECRET_REQUEST_TOKEN_URL, timeout=20
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"FatSecret request-token step failed: {type(exc).__name__}",
+        ) from exc
+
+    token = request_token.get("oauth_token")
+    token_secret = request_token.get("oauth_token_secret")
+    if not token or not token_secret:
+        raise HTTPException(status_code=502, detail="FatSecret did not return a request token.")
+
+    connection = get_fatsecret_connection(db, create=True)
+    connection.request_token = token
+    connection.request_token_secret = token_secret
+    connection.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    authorization_url = oauth.authorization_url(FATSECRET_AUTHORIZE_URL)
+    return RedirectResponse(authorization_url, status_code=302)
+
+
+@app.get("/fatsecret/callback", include_in_schema=False)
+def fatsecret_callback(
+    oauth_token: Optional[str] = None,
+    oauth_verifier: Optional[str] = None,
+    db: Session = Depends(db_session),
+):
+    if not oauth_token or not oauth_verifier:
+        return RedirectResponse("/?fatsecret=denied", status_code=302)
+
+    connection = get_fatsecret_connection(db)
+    if (
+        connection is None
+        or not connection.request_token
+        or not connection.request_token_secret
+        or not secrets.compare_digest(oauth_token, connection.request_token)
+    ):
+        raise HTTPException(status_code=400, detail="FatSecret OAuth state is invalid or expired.")
+
+    auth = OAuth1(
+        FATSECRET_CONSUMER_KEY,
+        client_secret=FATSECRET_CONSUMER_SECRET,
+        resource_owner_key=connection.request_token,
+        resource_owner_secret=connection.request_token_secret,
+        verifier=oauth_verifier,
+        signature_method="HMAC-SHA1",
+        signature_type="QUERY",
+    )
+    try:
+        response = requests.get(
+            FATSECRET_ACCESS_TOKEN_URL,
+            auth=auth,
+            timeout=20,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"FatSecret access-token step failed: {type(exc).__name__}",
+        ) from exc
+
+    token_data = parse_qs(response.text)
+    access_token = token_data.get("oauth_token", [None])[0]
+    access_token_secret = token_data.get("oauth_token_secret", [None])[0]
+    if not access_token or not access_token_secret:
+        raise HTTPException(status_code=502, detail="FatSecret did not return an access token.")
+
+    connection.access_token = access_token
+    connection.access_token_secret = access_token_secret
+    connection.request_token = None
+    connection.request_token_secret = None
+    connection.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return RedirectResponse("/?fatsecret=connected", status_code=302)
+
+
+@app.get("/fatsecret/disconnect", include_in_schema=False)
+def disconnect_fatsecret(
+    db: Session = Depends(db_session),
+    _: str = Depends(require_dashboard_access),
+):
+    connection = get_fatsecret_connection(db)
+    if connection:
+        connection.request_token = None
+        connection.request_token_secret = None
+        connection.access_token = None
+        connection.access_token_secret = None
+        connection.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    return RedirectResponse("/?fatsecret=disconnected", status_code=302)
 
 
 @app.post(
@@ -350,7 +513,7 @@ def create_meal(payload: MealCreate, db: Session = Depends(db_session)):
     if payload.fatsecret_food_id and payload.fatsecret_serving_id:
         try:
             meal.fatsecret_entry_id = sync_to_fatsecret(
-                meal, payload.fatsecret_number_of_units
+                db, meal, payload.fatsecret_number_of_units
             )
         except Exception as exc:
             meal.notes = (
@@ -429,7 +592,8 @@ def dashboard(
         selected=selected,
         meals=meals,
         totals=totals,
-        fatsecret_connected=fatsecret_ready(),
+        fatsecret_keys_configured=fatsecret_keys_configured(),
+        fatsecret_connected=fatsecret_connected(db),
         local_time=to_local,
         timezone_name=APP_TIMEZONE,
     )
