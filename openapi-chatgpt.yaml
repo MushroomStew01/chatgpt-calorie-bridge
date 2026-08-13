@@ -1,15 +1,15 @@
 openapi: 3.1.0
 info:
   title: Calorie Bridge
-  version: 1.1.0
-  description: Log estimated meals and retrieve daily calorie totals.
+  version: 1.5.0
+  description: Log estimated meals, automatically match them to FatSecret when connected, and retrieve daily calorie totals.
 servers:
   - url: https://chatgpt-calorie-bridge.onrender.com
 paths:
   /api/meals:
     post:
       operationId: logMeal
-      summary: Log a meal with calories and macros
+      summary: Log a meal and auto-sync the best FatSecret food and serving when connected
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -30,6 +30,9 @@ paths:
                 meal_type: { type: string, enum: [breakfast, lunch, dinner, other], default: other }
                 notes: { type: string, default: "" }
                 eaten_at: { type: string, format: date-time }
+                fatsecret_search_query:
+                  type: string
+                  description: Optional concise food name to improve FatSecret matching; omit to use name.
       responses:
         "200": { description: Meal logged }
     get:
