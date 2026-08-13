@@ -130,6 +130,8 @@ def signed_request(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=timeout,
         )
+    if method == "DELETE":
+        return requests.delete(url, params=combined, timeout=timeout)
     raise ValueError(f"Unsupported OAuth HTTP method: {method}")
 
 
@@ -266,6 +268,29 @@ def find_best_food_match(
     )
 
 
+def delete_diary_entry(
+    *,
+    consumer_key: str,
+    consumer_secret: str,
+    access_token: str,
+    access_token_secret: str,
+    food_entry_id: str,
+) -> None:
+    response = signed_request(
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        method="DELETE",
+        url=DIARY_URL,
+        request_parameters={
+            "food_entry_id": food_entry_id,
+            "format": "json",
+        },
+        token=access_token,
+        token_secret=access_token_secret,
+    )
+    _require_ok(response, "FatSecret diary cleanup failed")
+
+
 def create_diary_entry(
     *,
     consumer_key: str,
@@ -278,6 +303,8 @@ def create_diary_entry(
     food_entry_name: str,
     meal: str,
     date_int: int,
+    expected_calories: Optional[float] = None,
+    max_calorie_error_ratio: float = 0.15,
 ) -> Optional[str]:
     response = signed_request(
         consumer_key=consumer_key,
@@ -306,6 +333,43 @@ def create_diary_entry(
     entry = body.get("food_entries", {}).get("food_entry")
     if isinstance(entry, list):
         entry = entry[0] if entry else None
-    if isinstance(entry, dict) and entry.get("food_entry_id"):
-        return str(entry["food_entry_id"])
-    return None
+    if not isinstance(entry, dict):
+        return None
+
+    entry_id = str(entry.get("food_entry_id") or "") or None
+    actual_calories = 0.0
+    try:
+        actual_calories = float(entry.get("calories") or 0)
+    except (TypeError, ValueError):
+        actual_calories = 0.0
+
+    # FatSecret returns the calories it actually recorded. Validate that value
+    # against the ChatGPT/photo estimate so a bad match can never silently turn
+    # a 950 kcal meal into a 260 kcal diary entry again.
+    if expected_calories and expected_calories > 0 and actual_calories > 0:
+        error_ratio = abs(actual_calories - expected_calories) / expected_calories
+        if error_ratio > max_calorie_error_ratio:
+            cleanup_error = None
+            if entry_id:
+                try:
+                    delete_diary_entry(
+                        consumer_key=consumer_key,
+                        consumer_secret=consumer_secret,
+                        access_token=access_token,
+                        access_token_secret=access_token_secret,
+                        food_entry_id=entry_id,
+                    )
+                except FatSecretError as exc:
+                    cleanup_error = str(exc)
+
+            detail = (
+                f"FatSecret recorded {actual_calories:.0f} kcal for a "
+                f"{expected_calories:.0f} kcal estimate"
+            )
+            if cleanup_error:
+                detail += f"; automatic cleanup also failed: {cleanup_error}"
+            else:
+                detail += "; incorrect FatSecret entry was removed"
+            raise FatSecretError(detail)
+
+    return entry_id
