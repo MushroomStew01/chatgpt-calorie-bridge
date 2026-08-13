@@ -1,16 +1,10 @@
-import base64
-import hashlib
-import hmac
 import os
 import secrets
-import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo
 
-import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -19,6 +13,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, Float, Integer, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+from app import fatsecret
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -40,12 +36,15 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 FATSECRET_CONSUMER_KEY = os.getenv("FATSECRET_CONSUMER_KEY", "")
 FATSECRET_CONSUMER_SECRET = os.getenv("FATSECRET_CONSUMER_SECRET", "")
-# Optional legacy fallback. New connections are persisted in PostgreSQL.
 FATSECRET_ACCESS_TOKEN = os.getenv("FATSECRET_ACCESS_TOKEN", "")
 FATSECRET_ACCESS_TOKEN_SECRET = os.getenv("FATSECRET_ACCESS_TOKEN_SECRET", "")
-FATSECRET_REQUEST_TOKEN_URL = "https://authentication.fatsecret.com/oauth/request_token"
-FATSECRET_AUTHORIZE_URL = "https://authentication.fatsecret.com/oauth/authorize"
-FATSECRET_ACCESS_TOKEN_URL = "https://authentication.fatsecret.com/oauth/access_token"
+FATSECRET_MATCH_MIN_SCORE = float(os.getenv("FATSECRET_MATCH_MIN_SCORE", "0.32"))
+FATSECRET_MAX_SEARCH_RESULTS = max(
+    1, min(20, int(os.getenv("FATSECRET_MAX_SEARCH_RESULTS", "12")))
+)
+FATSECRET_DETAIL_CANDIDATES = max(
+    1, min(10, int(os.getenv("FATSECRET_DETAIL_CANDIDATES", "6")))
+)
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
@@ -95,7 +94,7 @@ class FatSecretConnection(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.4.0")
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.5.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -115,6 +114,7 @@ class MealCreate(BaseModel):
     meal_type: str = Field(default="other", pattern="^(breakfast|lunch|dinner|other)$")
     notes: str = Field(default="", max_length=500)
     eaten_at: Optional[datetime] = None
+    fatsecret_search_query: Optional[str] = Field(default=None, max_length=200)
     fatsecret_food_id: Optional[str] = None
     fatsecret_serving_id: Optional[str] = None
     fatsecret_number_of_units: float = Field(default=1.0, gt=0)
@@ -232,148 +232,99 @@ def public_base_url(request: Request) -> str:
     return PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
 
 
-def oauth_failure_detail(prefix: str, exc: Exception) -> str:
-    """Return the provider's response without exposing our credential values."""
-    response = getattr(exc, "response", None)
-    if response is not None:
-        body = (getattr(response, "text", "") or "").strip()
-        if len(body) > 500:
-            body = body[:500] + "..."
-        if body:
-            return f"{prefix}: HTTP {response.status_code}: {body}"
-        return f"{prefix}: HTTP {response.status_code}"
-
-    message = str(exc).strip()
-    if len(message) > 500:
-        message = message[:500] + "..."
-    return f"{prefix}: {type(exc).__name__}{': ' + message if message else ''}"
+def append_meal_note(meal: Meal, message: str) -> None:
+    message = (message or "").strip(" |")
+    if not message:
+        return
+    meal.notes = (f"{meal.notes} | {message}" if meal.notes else message)[:500]
 
 
-def oauth_percent(value: object) -> str:
-    """RFC 3986 percent-encoding used by FatSecret's OAuth 1.0 signer."""
-    return quote(str(value), safe="~-._")
+def auto_sync_meal_to_fatsecret(
+    db: Session,
+    meal: Meal,
+    search_query: Optional[str],
+) -> Optional[str]:
+    credentials = fatsecret_access_credentials(db)
+    if not credentials:
+        return None
 
-
-def fatsecret_oauth_parameters(
-    method: str,
-    url: str,
-    request_parameters: Optional[dict[str, object]] = None,
-    token: Optional[str] = None,
-    token_secret: str = "",
-    callback: Optional[str] = None,
-    verifier: Optional[str] = None,
-) -> dict[str, str]:
-    """Build OAuth 1.0 parameters exactly as FatSecret documents them."""
-    oauth: dict[str, str] = {
-        "oauth_consumer_key": FATSECRET_CONSUMER_KEY,
-        "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp": str(int(time_module.time())),
-        "oauth_nonce": secrets.token_hex(16),
-        "oauth_version": "1.0",
-    }
-    if token:
-        oauth["oauth_token"] = token
-    if callback:
-        oauth["oauth_callback"] = callback
-    if verifier:
-        oauth["oauth_verifier"] = verifier
-
-    signable: list[tuple[str, str]] = []
-    for key, value in (request_parameters or {}).items():
-        if value is not None:
-            signable.append((str(key), str(value)))
-    signable.extend(oauth.items())
-
-    encoded_pairs = sorted(
-        (oauth_percent(key), oauth_percent(value)) for key, value in signable
+    match = fatsecret.find_best_food_match(
+        consumer_key=FATSECRET_CONSUMER_KEY,
+        consumer_secret=FATSECRET_CONSUMER_SECRET,
+        query=(search_query or meal.name),
+        calories=meal.calories,
+        protein=meal.protein,
+        carbs=meal.carbs,
+        fat=meal.fat,
+        max_search_results=FATSECRET_MAX_SEARCH_RESULTS,
+        max_detail_candidates=FATSECRET_DETAIL_CANDIDATES,
     )
-    normalized = "&".join(f"{key}={value}" for key, value in encoded_pairs)
-    base_string = "&".join(
-        [method.upper(), oauth_percent(url), oauth_percent(normalized)]
-    )
-    signing_key = f"{oauth_percent(FATSECRET_CONSUMER_SECRET)}&{oauth_percent(token_secret)}"
-    digest = hmac.new(
-        signing_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha1,
-    ).digest()
-    oauth["oauth_signature"] = base64.b64encode(digest).decode("ascii")
-    return oauth
-
-
-def fatsecret_signed_request(
-    method: str,
-    url: str,
-    request_parameters: Optional[dict[str, object]] = None,
-    token: Optional[str] = None,
-    token_secret: str = "",
-    callback: Optional[str] = None,
-    verifier: Optional[str] = None,
-    timeout: int = 20,
-) -> requests.Response:
-    """Send a FatSecret OAuth 1.0 request using the exact normalized parameters."""
-    payload = {
-        key: value
-        for key, value in (request_parameters or {}).items()
-        if value is not None
-    }
-    oauth = fatsecret_oauth_parameters(
-        method=method,
-        url=url,
-        request_parameters=payload,
-        token=token,
-        token_secret=token_secret,
-        callback=callback,
-        verifier=verifier,
-    )
-    combined = {**payload, **oauth}
-
-    if method.upper() == "GET":
-        return requests.get(url, params=combined, timeout=timeout)
-    if method.upper() == "POST":
-        return requests.post(
-            url,
-            data=combined,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=timeout,
+    if match is None:
+        append_meal_note(meal, "FatSecret: no matching food found")
+        return None
+    if match.score < FATSECRET_MATCH_MIN_SCORE:
+        append_meal_note(
+            meal,
+            f"FatSecret: match confidence too low ({match.score:.2f})",
         )
-    raise ValueError(f"Unsupported OAuth HTTP method: {method}")
+        return None
+
+    access_token, access_token_secret = credentials
+    entry_id = fatsecret.create_diary_entry(
+        consumer_key=FATSECRET_CONSUMER_KEY,
+        consumer_secret=FATSECRET_CONSUMER_SECRET,
+        access_token=access_token,
+        access_token_secret=access_token_secret,
+        food_id=match.food_id,
+        serving_id=match.serving_id,
+        number_of_units=match.number_of_units,
+        food_entry_name=meal.name,
+        meal=meal.meal_type,
+        date_int=days_since_epoch(meal.eaten_at),
+    )
+
+    meal.fatsecret_food_id = match.food_id
+    meal.fatsecret_serving_id = match.serving_id
+    meal.fatsecret_entry_id = entry_id
+    if entry_id:
+        append_meal_note(
+            meal,
+            (
+                f"FatSecret synced: {match.display_name}; "
+                f"{match.number_of_units:g} × {match.serving_description}; "
+                f"match {match.score:.2f}"
+            ),
+        )
+    else:
+        append_meal_note(meal, "FatSecret: diary API returned no entry id")
+    return entry_id
 
 
-def sync_to_fatsecret(
-    db: Session, meal: Meal, number_of_units: float = 1.0
+def sync_explicit_fatsecret_entry(
+    db: Session,
+    meal: Meal,
+    number_of_units: float,
 ) -> Optional[str]:
     credentials = fatsecret_access_credentials(db)
     if not credentials or not meal.fatsecret_food_id or not meal.fatsecret_serving_id:
         return None
-
     access_token, access_token_secret = credentials
-    payload = {
-        "food_id": meal.fatsecret_food_id,
-        "food_entry_name": meal.name,
-        "serving_id": meal.fatsecret_serving_id,
-        "number_of_units": number_of_units,
-        "meal": meal.meal_type,
-        "date": days_since_epoch(meal.eaten_at),
-        "format": "json",
-    }
-    response = fatsecret_signed_request(
-        "POST",
-        "https://platform.fatsecret.com/rest/food-entries/v1",
-        request_parameters=payload,
-        token=access_token,
-        token_secret=access_token_secret,
+    entry_id = fatsecret.create_diary_entry(
+        consumer_key=FATSECRET_CONSUMER_KEY,
+        consumer_secret=FATSECRET_CONSUMER_SECRET,
+        access_token=access_token,
+        access_token_secret=access_token_secret,
+        food_id=meal.fatsecret_food_id,
+        serving_id=meal.fatsecret_serving_id,
+        number_of_units=number_of_units,
+        food_entry_name=meal.name,
+        meal=meal.meal_type,
+        date_int=days_since_epoch(meal.eaten_at),
     )
-    response.raise_for_status()
-    body = response.json()
-    entry = body.get("food_entries", {}).get("food_entry")
-    if isinstance(entry, list):
-        entry = entry[0] if entry else None
-    return (
-        str(entry.get("food_entry_id"))
-        if isinstance(entry, dict) and entry.get("food_entry_id")
-        else None
-    )
+    meal.fatsecret_entry_id = entry_id
+    if entry_id:
+        append_meal_note(meal, "FatSecret synced using supplied food/serving")
+    return entry_id
 
 
 def meal_query_for_day(day: date):
@@ -386,15 +337,21 @@ def action_schema(base_url: str) -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.4.0",
-            "description": "Log estimated meals and retrieve daily calorie totals.",
+            "version": "1.5.0",
+            "description": (
+                "Log estimated meals, automatically match them to FatSecret when "
+                "connected, and retrieve daily calorie totals."
+            ),
         },
         "servers": [{"url": base_url.rstrip("/")}],
         "paths": {
             "/api/meals": {
                 "post": {
                     "operationId": "logMeal",
-                    "summary": "Log a meal with calories and macros",
+                    "summary": (
+                        "Log a meal with calories/macros and auto-sync the best "
+                        "FatSecret food and serving when connected"
+                    ),
                     "security": [{"ApiKeyAuth": []}],
                     "requestBody": {
                         "required": True,
@@ -425,6 +382,13 @@ def action_schema(base_url: str) -> dict:
                                         "eaten_at": {
                                             "type": "string",
                                             "format": "date-time",
+                                        },
+                                        "fatsecret_search_query": {
+                                            "type": "string",
+                                            "description": (
+                                                "Optional concise food name to improve "
+                                                "FatSecret matching; omit to use name."
+                                            ),
                                         },
                                     },
                                 }
@@ -483,6 +447,8 @@ def health(db: Session = Depends(db_session)):
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
         "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",
+        "fatsecret_auto_match": True,
+        "fatsecret_match_min_score": FATSECRET_MATCH_MIN_SCORE,
     }
 
 
@@ -504,43 +470,25 @@ def connect_fatsecret(
         )
 
     callback_url = f"{public_base_url(request)}/fatsecret/callback"
-
     try:
-        response = fatsecret_signed_request(
-            "POST",
-            FATSECRET_REQUEST_TOKEN_URL,
-            callback=callback_url,
+        token_pair = fatsecret.request_token(
+            FATSECRET_CONSUMER_KEY,
+            FATSECRET_CONSUMER_SECRET,
+            callback_url,
         )
-        response.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=oauth_failure_detail("FatSecret request-token step failed", exc),
-        ) from exc
-
-    request_token = parse_qs(response.text)
-    token = request_token.get("oauth_token", [None])[0]
-    token_secret = request_token.get("oauth_token_secret", [None])[0]
-    callback_confirmed = request_token.get("oauth_callback_confirmed", [None])[0]
-    if not token or not token_secret:
-        raise HTTPException(
-            status_code=502,
-            detail=f"FatSecret did not return an OAuth request token and secret. Response: {response.text[:300]}",
-        )
-    if callback_confirmed not in (None, "true", True):
-        raise HTTPException(
-            status_code=502,
-            detail="FatSecret did not confirm the OAuth callback URL.",
-        )
+    except fatsecret.FatSecretError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     connection = get_fatsecret_connection(db, create=True)
-    connection.request_token = token
-    connection.request_token_secret = token_secret
+    connection.request_token = token_pair.token
+    connection.request_token_secret = token_pair.secret
     connection.updated_at = datetime.now(timezone.utc)
     db.commit()
 
-    authorization_url = f"{FATSECRET_AUTHORIZE_URL}?oauth_token={oauth_percent(token)}"
-    return RedirectResponse(authorization_url, status_code=302)
+    return RedirectResponse(
+        fatsecret.authorization_url(token_pair.token),
+        status_code=302,
+    )
 
 
 @app.get("/fatsecret/callback", include_in_schema=False)
@@ -565,31 +513,18 @@ def fatsecret_callback(
         )
 
     try:
-        response = fatsecret_signed_request(
-            "GET",
-            FATSECRET_ACCESS_TOKEN_URL,
-            token=connection.request_token,
-            token_secret=connection.request_token_secret,
-            verifier=oauth_verifier,
+        token_pair = fatsecret.exchange_access_token(
+            FATSECRET_CONSUMER_KEY,
+            FATSECRET_CONSUMER_SECRET,
+            connection.request_token,
+            connection.request_token_secret,
+            oauth_verifier,
         )
-        response.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=oauth_failure_detail("FatSecret access-token step failed", exc),
-        ) from exc
+    except fatsecret.FatSecretError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    token_data = parse_qs(response.text)
-    access_token = token_data.get("oauth_token", [None])[0]
-    access_token_secret = token_data.get("oauth_token_secret", [None])[0]
-    if not access_token or not access_token_secret:
-        raise HTTPException(
-            status_code=502,
-            detail=f"FatSecret did not return an access token. Response: {response.text[:300]}",
-        )
-
-    connection.access_token = access_token
-    connection.access_token_secret = access_token_secret
+    connection.access_token = token_pair.token
+    connection.access_token_secret = token_pair.secret
     connection.request_token = None
     connection.request_token_secret = None
     connection.updated_at = datetime.now(timezone.utc)
@@ -639,17 +574,27 @@ def create_meal(payload: MealCreate, db: Session = Depends(db_session)):
     db.commit()
     db.refresh(meal)
 
-    if payload.fatsecret_food_id and payload.fatsecret_serving_id:
+    if fatsecret_connected(db):
         try:
-            meal.fatsecret_entry_id = sync_to_fatsecret(
-                db,
-                meal,
-                payload.fatsecret_number_of_units,
-            )
+            if payload.fatsecret_food_id and payload.fatsecret_serving_id:
+                sync_explicit_fatsecret_entry(
+                    db,
+                    meal,
+                    payload.fatsecret_number_of_units,
+                )
+            else:
+                auto_sync_meal_to_fatsecret(
+                    db,
+                    meal,
+                    payload.fatsecret_search_query,
+                )
+        except fatsecret.FatSecretError as exc:
+            append_meal_note(meal, f"FatSecret sync failed: {exc}")
         except Exception as exc:
-            meal.notes = (
-                meal.notes + f" | FatSecret sync failed: {exc}"
-            ).strip(" |")[:500]
+            append_meal_note(
+                meal,
+                f"FatSecret sync failed: {type(exc).__name__}",
+            )
         db.commit()
         db.refresh(meal)
 
