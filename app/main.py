@@ -1,9 +1,13 @@
+import base64
+import hashlib
+import hmac
 import os
 import secrets
+import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo
 
 import requests
@@ -13,7 +17,6 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
-from requests_oauthlib import OAuth1, OAuth1Session
 from sqlalchemy import DateTime, Float, Integer, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -92,7 +95,7 @@ class FatSecretConnection(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.3.0")
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.4.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -246,6 +249,97 @@ def oauth_failure_detail(prefix: str, exc: Exception) -> str:
     return f"{prefix}: {type(exc).__name__}{': ' + message if message else ''}"
 
 
+def oauth_percent(value: object) -> str:
+    """RFC 3986 percent-encoding used by FatSecret's OAuth 1.0 signer."""
+    return quote(str(value), safe="~-._")
+
+
+def fatsecret_oauth_parameters(
+    method: str,
+    url: str,
+    request_parameters: Optional[dict[str, object]] = None,
+    token: Optional[str] = None,
+    token_secret: str = "",
+    callback: Optional[str] = None,
+    verifier: Optional[str] = None,
+) -> dict[str, str]:
+    """Build OAuth 1.0 parameters exactly as FatSecret documents them."""
+    oauth: dict[str, str] = {
+        "oauth_consumer_key": FATSECRET_CONSUMER_KEY,
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(int(time_module.time())),
+        "oauth_nonce": secrets.token_hex(16),
+        "oauth_version": "1.0",
+    }
+    if token:
+        oauth["oauth_token"] = token
+    if callback:
+        oauth["oauth_callback"] = callback
+    if verifier:
+        oauth["oauth_verifier"] = verifier
+
+    signable: list[tuple[str, str]] = []
+    for key, value in (request_parameters or {}).items():
+        if value is not None:
+            signable.append((str(key), str(value)))
+    signable.extend(oauth.items())
+
+    encoded_pairs = sorted(
+        (oauth_percent(key), oauth_percent(value)) for key, value in signable
+    )
+    normalized = "&".join(f"{key}={value}" for key, value in encoded_pairs)
+    base_string = "&".join(
+        [method.upper(), oauth_percent(url), oauth_percent(normalized)]
+    )
+    signing_key = f"{oauth_percent(FATSECRET_CONSUMER_SECRET)}&{oauth_percent(token_secret)}"
+    digest = hmac.new(
+        signing_key.encode("utf-8"),
+        base_string.encode("utf-8"),
+        hashlib.sha1,
+    ).digest()
+    oauth["oauth_signature"] = base64.b64encode(digest).decode("ascii")
+    return oauth
+
+
+def fatsecret_signed_request(
+    method: str,
+    url: str,
+    request_parameters: Optional[dict[str, object]] = None,
+    token: Optional[str] = None,
+    token_secret: str = "",
+    callback: Optional[str] = None,
+    verifier: Optional[str] = None,
+    timeout: int = 20,
+) -> requests.Response:
+    """Send a FatSecret OAuth 1.0 request using the exact normalized parameters."""
+    payload = {
+        key: value
+        for key, value in (request_parameters or {}).items()
+        if value is not None
+    }
+    oauth = fatsecret_oauth_parameters(
+        method=method,
+        url=url,
+        request_parameters=payload,
+        token=token,
+        token_secret=token_secret,
+        callback=callback,
+        verifier=verifier,
+    )
+    combined = {**payload, **oauth}
+
+    if method.upper() == "GET":
+        return requests.get(url, params=combined, timeout=timeout)
+    if method.upper() == "POST":
+        return requests.post(
+            url,
+            data=combined,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=timeout,
+        )
+    raise ValueError(f"Unsupported OAuth HTTP method: {method}")
+
+
 def sync_to_fatsecret(
     db: Session, meal: Meal, number_of_units: float = 1.0
 ) -> Optional[str]:
@@ -254,14 +348,6 @@ def sync_to_fatsecret(
         return None
 
     access_token, access_token_secret = credentials
-    auth = OAuth1(
-        FATSECRET_CONSUMER_KEY,
-        client_secret=FATSECRET_CONSUMER_SECRET,
-        resource_owner_key=access_token,
-        resource_owner_secret=access_token_secret,
-        signature_method="HMAC-SHA1",
-        signature_type="QUERY",
-    )
     payload = {
         "food_id": meal.fatsecret_food_id,
         "food_entry_name": meal.name,
@@ -271,11 +357,12 @@ def sync_to_fatsecret(
         "date": days_since_epoch(meal.eaten_at),
         "format": "json",
     }
-    response = requests.post(
+    response = fatsecret_signed_request(
+        "POST",
         "https://platform.fatsecret.com/rest/food-entries/v1",
-        data=payload,
-        auth=auth,
-        timeout=20,
+        request_parameters=payload,
+        token=access_token,
+        token_secret=access_token_secret,
     )
     response.raise_for_status()
     body = response.json()
@@ -299,7 +386,7 @@ def action_schema(base_url: str) -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.3.0",
+            "version": "1.4.0",
             "description": "Log estimated meals and retrieve daily calorie totals.",
         },
         "servers": [{"url": base_url.rstrip("/")}],
@@ -395,7 +482,7 @@ def health(db: Session = Depends(db_session)):
         "status": "ok",
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
-        "fatsecret_oauth_signature_transport": "query",
+        "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",
     }
 
 
@@ -418,35 +505,27 @@ def connect_fatsecret(
 
     callback_url = f"{public_base_url(request)}/fatsecret/callback"
 
-    # FatSecret's OAuth 1.0 documentation describes these OAuth parameters as
-    # request parameters. requests-oauthlib defaults to an Authorization header,
-    # so force query-string signing for compatibility with FatSecret.
-    oauth = OAuth1Session(
-        FATSECRET_CONSUMER_KEY,
-        client_secret=FATSECRET_CONSUMER_SECRET,
-        callback_uri=callback_url,
-        signature_method="HMAC-SHA1",
-        signature_type="QUERY",
-    )
-
     try:
-        request_token = oauth.fetch_request_token(
+        response = fatsecret_signed_request(
+            "POST",
             FATSECRET_REQUEST_TOKEN_URL,
-            timeout=20,
+            callback=callback_url,
         )
+        response.raise_for_status()
     except Exception as exc:
         raise HTTPException(
             status_code=502,
             detail=oauth_failure_detail("FatSecret request-token step failed", exc),
         ) from exc
 
-    token = request_token.get("oauth_token")
-    token_secret = request_token.get("oauth_token_secret")
-    callback_confirmed = request_token.get("oauth_callback_confirmed")
+    request_token = parse_qs(response.text)
+    token = request_token.get("oauth_token", [None])[0]
+    token_secret = request_token.get("oauth_token_secret", [None])[0]
+    callback_confirmed = request_token.get("oauth_callback_confirmed", [None])[0]
     if not token or not token_secret:
         raise HTTPException(
             status_code=502,
-            detail="FatSecret did not return an OAuth request token and secret.",
+            detail=f"FatSecret did not return an OAuth request token and secret. Response: {response.text[:300]}",
         )
     if callback_confirmed not in (None, "true", True):
         raise HTTPException(
@@ -460,10 +539,7 @@ def connect_fatsecret(
     connection.updated_at = datetime.now(timezone.utc)
     db.commit()
 
-    authorization_url = oauth.authorization_url(
-        FATSECRET_AUTHORIZE_URL,
-        request_token=token,
-    )
+    authorization_url = f"{FATSECRET_AUTHORIZE_URL}?oauth_token={oauth_percent(token)}"
     return RedirectResponse(authorization_url, status_code=302)
 
 
@@ -488,21 +564,13 @@ def fatsecret_callback(
             detail="FatSecret OAuth state is invalid or expired.",
         )
 
-    auth = OAuth1(
-        FATSECRET_CONSUMER_KEY,
-        client_secret=FATSECRET_CONSUMER_SECRET,
-        resource_owner_key=connection.request_token,
-        resource_owner_secret=connection.request_token_secret,
-        verifier=oauth_verifier,
-        signature_method="HMAC-SHA1",
-        signature_type="QUERY",
-    )
-
     try:
-        response = requests.get(
+        response = fatsecret_signed_request(
+            "GET",
             FATSECRET_ACCESS_TOKEN_URL,
-            auth=auth,
-            timeout=20,
+            token=connection.request_token,
+            token_secret=connection.request_token_secret,
+            verifier=oauth_verifier,
         )
         response.raise_for_status()
     except Exception as exc:
