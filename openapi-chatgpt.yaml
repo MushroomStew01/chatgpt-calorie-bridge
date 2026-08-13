@@ -9,6 +9,7 @@ paths:
   /api/meals:
     post:
       operationId: logMeal
+      x-openai-isConsequential: false
       summary: Log a meal and auto-sync the best FatSecret food and serving when connected
       security:
         - ApiKeyAuth: []
