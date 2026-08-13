@@ -26,3 +26,9 @@ services:
         value: America/Toronto
       - key: DAILY_CALORIE_GOAL
         value: "2000"
+      - key: PUBLIC_BASE_URL
+        value: https://chatgpt-calorie-bridge.onrender.com
+      - key: FATSECRET_CONSUMER_KEY
+        sync: false
+      - key: FATSECRET_CONSUMER_SECRET
+        sync: false
