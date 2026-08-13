@@ -22,6 +22,11 @@ FILLER_WORDS = {
     "with",
 }
 
+# Brand foods cannot be scaled with number_of_units in FatSecret. If a brand
+# serving is far from the photo-derived calorie estimate, it is not a safe
+# candidate for automatic logging. Generic foods remain scalable.
+MAX_BRAND_CALORIE_ERROR_RATIO = 0.20
+
 
 @dataclass(frozen=True)
 class FatSecretMatch:
@@ -165,11 +170,19 @@ def _best_serving_for_food(
 
         is_generic = food_type.lower() == "generic"
         if is_generic and target_calories > 0:
+            # For Generic foods FatSecret accepts number_of_units in the serving's
+            # measurement units, so scale the chosen serving to the estimate.
             scale = target_calories / base_calories
             number_of_units = base_units * scale
         else:
-            # FatSecret documents Brand foods as number_of_units=1. Choose the
-            # closest available serving rather than scaling a brand serving.
+            # FatSecret requires Brand foods to use number_of_units=1. A brand
+            # serving that is nowhere near the photo estimate would therefore
+            # create the exact bug we want to avoid (e.g. 260 kcal logged for a
+            # 950 kcal meal), so reject it rather than silently under-log.
+            if target_calories > 0:
+                calorie_error = abs(base_calories - target_calories) / target_calories
+                if calorie_error > MAX_BRAND_CALORIE_ERROR_RATIO:
+                    continue
             scale = 1.0
             number_of_units = 1.0
 
@@ -277,7 +290,9 @@ def choose_best_match(
         ) = serving_match
 
         food_type = str(detailed.get("food_type") or result.get("food_type") or "")
-        generic_bonus = 0.04 if food_type.lower() == "generic" else 0.0
+        # Photo meals are normally unbranded. Prefer a Generic entry because it
+        # can be scaled to the estimated portion while a Brand serving cannot.
+        generic_bonus = 0.08 if food_type.lower() == "generic" else 0.0
         total_score = min(1.0, 0.58 * name_score + 0.38 * serving_score + generic_bonus)
 
         candidate = FatSecretMatch(
