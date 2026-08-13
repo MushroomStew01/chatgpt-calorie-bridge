@@ -129,3 +129,71 @@ def test_derived_serving_id_zero_is_not_selected():
 
     assert match is not None
     assert match.serving_id == "31"
+
+
+def test_photo_meal_rejects_low_calorie_brand_and_uses_scalable_generic():
+    search_results = [
+        {
+            "food_id": "400",
+            "food_name": "Chicken and Rice Bowl with Peas, Spicy Sauce, Chili Flakes, and Crackers",
+            "brand_name": "Example Brand",
+            "food_type": "Brand",
+        },
+        {
+            "food_id": "401",
+            "food_name": "Chicken and Rice",
+            "food_type": "Generic",
+        },
+    ]
+
+    details = {
+        "400": {
+            "food_id": "400",
+            "food_name": "Chicken and Rice Bowl with Peas, Spicy Sauce, Chili Flakes, and Crackers",
+            "brand_name": "Example Brand",
+            "food_type": "Brand",
+            "servings": {
+                "serving": {
+                    "serving_id": "40",
+                    "serving_description": "1/2 cup, 65 g",
+                    "number_of_units": "1",
+                    "calories": "260",
+                    "protein": "12",
+                    "carbohydrate": "30",
+                    "fat": "9",
+                }
+            },
+        },
+        "401": {
+            "food_id": "401",
+            "food_name": "Chicken and Rice",
+            "food_type": "Generic",
+            "servings": {
+                "serving": {
+                    "serving_id": "41",
+                    "serving_description": "1 cup",
+                    "number_of_units": "1",
+                    "calories": "475",
+                    "protein": "30",
+                    "carbohydrate": "55",
+                    "fat": "14",
+                }
+            },
+        },
+    }
+
+    match = choose_best_match(
+        "chicken and rice bowl with peas spicy sauce chili flakes crackers",
+        search_results,
+        lambda food_id: details[food_id],
+        target_calories=950,
+        target_protein=60,
+        target_carbs=110,
+        target_fat=28,
+    )
+
+    assert match is not None
+    assert match.food_id == "401"
+    assert match.food_type == "Generic"
+    assert match.number_of_units == 2.0
+    assert match.predicted_calories == 950.0
