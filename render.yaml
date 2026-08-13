@@ -32,3 +32,9 @@ services:
         sync: false
       - key: FATSECRET_CONSUMER_SECRET
         sync: false
+      - key: FATSECRET_MATCH_MIN_SCORE
+        value: "0.32"
+      - key: FATSECRET_MAX_SEARCH_RESULTS
+        value: "12"
+      - key: FATSECRET_DETAIL_CANDIDATES
+        value: "6"
