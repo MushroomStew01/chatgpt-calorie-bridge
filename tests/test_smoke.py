@@ -13,6 +13,7 @@ os.environ["APP_TIMEZONE"] = "America/Toronto"
 os.environ["DAILY_CALORIE_GOAL"] = "2000"
 
 from fastapi.testclient import TestClient
+import app.main as main
 from app.main import app
 
 client = TestClient(app)
@@ -26,6 +27,7 @@ def test_health():
     assert body["status"] == "ok"
     assert body["fatsecret_keys_configured"] is False
     assert body["fatsecret_connected"] is False
+    assert body["fatsecret_oauth_signer"] == "manual-rfc3986-hmac-sha1"
 
 
 def test_api_reads_require_key():
@@ -69,6 +71,23 @@ def test_fatsecret_connect_requires_dashboard_auth_and_keys():
     assert client.get("/fatsecret/connect").status_code == 401
     response = client.get("/fatsecret/connect", auth=("test-user", "test-pass"))
     assert response.status_code == 503
+
+
+def test_oauth_signer_matches_rfc5849_example(monkeypatch):
+    monkeypatch.setattr(main, "FATSECRET_CONSUMER_KEY", "dpf43f3p2l4k3l03")
+    monkeypatch.setattr(main, "FATSECRET_CONSUMER_SECRET", "kd94hf93k423kf44")
+    monkeypatch.setattr(main.time_module, "time", lambda: 1191242096)
+    monkeypatch.setattr(main.secrets, "token_hex", lambda _: "kllo9940pd9333jh")
+
+    oauth = main.fatsecret_oauth_parameters(
+        method="GET",
+        url="http://photos.example.net/photos",
+        request_parameters={"file": "vacation.jpg", "size": "original"},
+        token="nnch734d00sl2jdk",
+        token_secret="pfkkdhi9sl3r4s00",
+    )
+
+    assert oauth["oauth_signature"] == "tR3+Ty81lMeYAr/Fid0kMTYa/WM="
 
 
 def test_dynamic_action_schema():
