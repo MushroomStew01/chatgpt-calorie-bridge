@@ -22,7 +22,10 @@ API_HEADERS = {"X-API-Key": "test-key"}
 def test_health():
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["fatsecret_keys_configured"] is False
+    assert body["fatsecret_connected"] is False
 
 
 def test_api_reads_require_key():
@@ -59,6 +62,13 @@ def test_dashboard_requires_basic_auth():
     response = client.get("/", auth=("test-user", "test-pass"))
     assert response.status_code == 200
     assert "Calorie Dashboard" in response.text
+    assert "FatSecret keys not configured" in response.text
+
+
+def test_fatsecret_connect_requires_dashboard_auth_and_keys():
+    assert client.get("/fatsecret/connect").status_code == 401
+    response = client.get("/fatsecret/connect", auth=("test-user", "test-pass"))
+    assert response.status_code == 503
 
 
 def test_dynamic_action_schema():
@@ -66,4 +76,5 @@ def test_dynamic_action_schema():
     assert response.status_code == 200
     body = response.json()
     assert body["paths"]["/api/meals"]["post"]["operationId"] == "logMeal"
+    assert body["components"]["schemas"] == {}
     assert body["components"]["securitySchemes"]["ApiKeyAuth"]["name"] == "X-API-Key"
