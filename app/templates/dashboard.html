@@ -30,7 +30,17 @@
   <section class="panel">
     <div class="panel-head">
       <h2>Meals</h2>
-      <span class="status {{ 'ok' if fatsecret_connected else '' }}">FatSecret {{ 'connected' if fatsecret_connected else 'not configured' }}</span>
+      <div class="integration-actions">
+        {% if fatsecret_connected %}
+          <span class="status ok">FatSecret connected</span>
+          <a class="integration-link" href="/fatsecret/disconnect">Disconnect</a>
+        {% elif fatsecret_keys_configured %}
+          <span class="status">FatSecret ready to connect</span>
+          <a class="integration-button" href="/fatsecret/connect">Connect FatSecret</a>
+        {% else %}
+          <span class="status">FatSecret keys not configured</span>
+        {% endif %}
+      </div>
     </div>
     {% if meals %}
     <div class="table-wrap">
