@@ -32,7 +32,7 @@
       <h2>Meals</h2>
       <div class="integration-actions">
         {% if fatsecret_connected %}
-          <span class="status ok">FatSecret connected</span>
+          <span class="status ok">FatSecret connected · auto-sync on</span>
           <a class="integration-link" href="/fatsecret/disconnect">Disconnect</a>
         {% elif fatsecret_keys_configured %}
           <span class="status">FatSecret ready to connect</span>
@@ -45,7 +45,7 @@
     {% if meals %}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Time</th><th>Meal</th><th>Calories</th><th>Protein</th><th>Carbs</th><th>Fat</th></tr></thead>
+        <thead><tr><th>Time</th><th>Meal</th><th>Calories</th><th>Protein</th><th>Carbs</th><th>Fat</th><th>FatSecret</th></tr></thead>
         <tbody>
         {% for meal in meals %}
           <tr>
@@ -55,6 +55,15 @@
             <td>{{ meal.protein }}</td>
             <td>{{ meal.carbs }}</td>
             <td>{{ meal.fat }}</td>
+            <td>
+              {% if meal.fatsecret_entry_id %}
+                <span class="sync-state synced">Synced</span>
+              {% elif fatsecret_connected %}
+                <span class="sync-state local">Local only</span>
+              {% else %}
+                <span class="sync-state local">—</span>
+              {% endif %}
+            </td>
           </tr>
         {% endfor %}
         </tbody>
