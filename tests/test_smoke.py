@@ -25,10 +25,13 @@ def test_health():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
+    assert body["api_version"] == "1.6.0"
     assert body["fatsecret_keys_configured"] is False
     assert body["fatsecret_connected"] is False
     assert body["fatsecret_oauth_signer"] == "manual-rfc3986-hmac-sha1"
     assert body["fatsecret_auto_match"] is True
+    assert body["fatsecret_sync_mode"] == "background"
+    assert body["get_meals_default_scope"] == "today"
 
 
 def test_api_reads_require_key():
@@ -58,6 +61,25 @@ def test_log_and_summarize_meal():
     assert body["calorie_goal"] == 2000
     assert body["calories_remaining"] == 1500
     assert body["timezone"] == "America/Toronto"
+
+
+def test_get_meals_defaults_to_today_instead_of_lifetime_history():
+    old = client.post(
+        "/api/meals",
+        headers=API_HEADERS,
+        json={
+            "name": "Very old meal",
+            "calories": 123,
+            "eaten_at": "2020-01-01T12:00:00Z",
+        },
+    )
+    assert old.status_code == 200
+
+    response = client.get("/api/meals", headers=API_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) <= 25
+    assert all(meal["name"] != "Very old meal" for meal in body)
 
 
 def test_dashboard_requires_basic_auth():
@@ -95,6 +117,7 @@ def test_dynamic_action_schema():
     body = response.json()
     action = body["paths"]["/api/meals"]["post"]
     assert action["operationId"] == "logMeal"
+    assert action["x-openai-isConsequential"] is False
     props = action["requestBody"]["content"]["application/json"]["schema"]["properties"]
     assert "fatsecret_search_query" in props
     assert body["components"]["schemas"] == {}
