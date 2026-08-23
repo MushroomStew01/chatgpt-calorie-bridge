@@ -53,8 +53,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 read -r -p "Dashboard username [andy]: " DASHBOARD_USERNAME
-aDASHBOARD_USERNAME="${DASHBOARD_USERNAME:-andy}"
-DASHBOARD_USERNAME="$aDASHBOARD_USERNAME"
+DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-andy}"
 
 read -r -s -p "Existing Dashboard password (Enter to generate a new one): " DASHBOARD_PASSWORD
 echo
@@ -125,6 +124,7 @@ PUBLIC_BASE_URL="https://${DNS_NAME}"
 python3 - "$ENV_FILE" "$PUBLIC_BASE_URL" <<'PY'
 from pathlib import Path
 import sys
+
 path = Path(sys.argv[1])
 url = sys.argv[2]
 lines = path.read_text().splitlines()
@@ -158,7 +158,7 @@ done
 
 say "Raspberry Pi calorie bridge is configured"
 echo "Public URL: ${PUBLIC_BASE_URL}"
-echo "Dashboard:  ${PUBLIC_BASE_URL}/"
+echo "Dashboard: ${PUBLIC_BASE_URL}/"
 echo "Action schema: ${PUBLIC_BASE_URL}/action-openapi.json"
 echo
 echo "IMPORTANT:"
