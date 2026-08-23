@@ -1,4 +1,6 @@
 .env
+.env.pi
+.env.pi.backup.*
 calories.db
 *.db
 __pycache__/
