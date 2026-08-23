@@ -10,6 +10,22 @@ ENV_FILE=".env.pi"
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
+get_env_value() {
+  local key="$1"
+  python3 - "$ENV_FILE" "$key" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+key = sys.argv[2]
+if not path.exists():
+    raise SystemExit(0)
+for line in path.read_text().splitlines():
+    if line.startswith(key + "="):
+        print(line.split("=", 1)[1])
+        break
+PY
+}
+
 say "Installing required host packages"
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl git jq openssl
@@ -40,43 +56,54 @@ fi
 
 say "Cloning/updating calorie bridge"
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" fetch origin main
-  git -C "$APP_DIR" reset --hard origin/main
+  git -C "$APP_DIR" checkout main
+  git -C "$APP_DIR" pull --ff-only origin main
 else
   git clone "$REPO_URL" "$APP_DIR"
 fi
 cd "$APP_DIR"
 
+REUSE_EXISTING="false"
 if [ -f "$ENV_FILE" ]; then
   cp "$ENV_FILE" "${ENV_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
   echo "Existing $ENV_FILE backed up."
+  read -r -p "Reuse the existing Pi configuration and PostgreSQL password? [Y/n]: " REUSE_REPLY
+  REUSE_REPLY="${REUSE_REPLY:-Y}"
+  case "$REUSE_REPLY" in
+    [Yy]|[Yy][Ee][Ss]) REUSE_EXISTING="true" ;;
+  esac
 fi
 
-read -r -p "Dashboard username [andy]: " DASHBOARD_USERNAME
-DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-andy}"
+if [ "$REUSE_EXISTING" = "true" ]; then
+  HOST_PORT="$(get_env_value CALORIE_BRIDGE_HOST_PORT)"
+  HOST_PORT="${HOST_PORT:-8021}"
+  echo "Reusing existing .env.pi. Secrets were not changed."
+else
+  read -r -p "Dashboard username [andy]: " DASHBOARD_USERNAME
+  DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-andy}"
 
-read -r -s -p "Existing Dashboard password (Enter to generate a new one): " DASHBOARD_PASSWORD
-echo
-if [ -z "$DASHBOARD_PASSWORD" ]; then
-  DASHBOARD_PASSWORD="$(openssl rand -hex 24)"
-fi
+  read -r -s -p "Existing Dashboard password (Enter to generate a new one): " DASHBOARD_PASSWORD
+  echo
+  if [ -z "$DASHBOARD_PASSWORD" ]; then
+    DASHBOARD_PASSWORD="$(openssl rand -hex 24)"
+  fi
 
-read -r -s -p "Existing APP_API_KEY from Render (Enter to generate a new one): " APP_API_KEY
-echo
-if [ -z "$APP_API_KEY" ]; then
-  APP_API_KEY="$(openssl rand -hex 32)"
-fi
+  read -r -s -p "Existing APP_API_KEY from Render (Enter to generate a new one): " APP_API_KEY
+  echo
+  if [ -z "$APP_API_KEY" ]; then
+    APP_API_KEY="$(openssl rand -hex 32)"
+  fi
 
-read -r -p "FatSecret Consumer Key: " FATSECRET_CONSUMER_KEY
-[ -n "$FATSECRET_CONSUMER_KEY" ] || die "FatSecret Consumer Key cannot be blank."
+  read -r -p "FatSecret Consumer Key: " FATSECRET_CONSUMER_KEY
+  [ -n "$FATSECRET_CONSUMER_KEY" ] || die "FatSecret Consumer Key cannot be blank."
 
-read -r -s -p "FatSecret Consumer Secret: " FATSECRET_CONSUMER_SECRET
-echo
-[ -n "$FATSECRET_CONSUMER_SECRET" ] || die "FatSecret Consumer Secret cannot be blank."
+  read -r -s -p "FatSecret Consumer Secret: " FATSECRET_CONSUMER_SECRET
+  echo
+  [ -n "$FATSECRET_CONSUMER_SECRET" ] || die "FatSecret Consumer Secret cannot be blank."
 
-POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+  POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 
-cat > "$ENV_FILE" <<EOF
+  cat > "$ENV_FILE" <<EOF
 POSTGRES_DB=calorie_bridge
 POSTGRES_USER=calorie_bridge
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -95,7 +122,8 @@ FATSECRET_MATCH_MIN_SCORE=0.32
 FATSECRET_MAX_SEARCH_RESULTS=12
 FATSECRET_DETAIL_CANDIDATES=6
 EOF
-chmod 600 "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+fi
 
 say "Building and starting PostgreSQL + calorie bridge"
 sudo docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build
