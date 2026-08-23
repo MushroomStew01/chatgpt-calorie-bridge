@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: calorie-bridge-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-calorie_bridge}
+      POSTGRES_USER: ${POSTGRES_USER:-calorie_bridge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - calorie_bridge_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-calorie_bridge} -d ${POSTGRES_DB:-calorie_bridge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - calorie_bridge_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: calorie-bridge-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.pi
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-calorie_bridge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-calorie_bridge}
+      PORT: "8000"
+    ports:
+      - "127.0.0.1:${CALORIE_BRIDGE_HOST_PORT:-8021}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()\"",
+        ]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 15s
+    networks:
+      - calorie_bridge_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  calorie_bridge_internal:
+    driver: bridge
+
+volumes:
+  calorie_bridge_pgdata:
+    name: calorie_bridge_pgdata
