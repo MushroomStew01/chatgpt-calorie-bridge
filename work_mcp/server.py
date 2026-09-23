@@ -230,12 +230,25 @@ def build_app(config, transport=None):
     metadata["revocation_endpoint_auth_methods_supported"] = ["none"]
     # SDK issuer normalizes trailing slash; use that exact string in authorization responses.
     async def metadata_handler(request):
-        return JSONResponse(metadata, headers={"Cache-Control":"no-store"})
+        return JSONResponse(metadata, headers={"Cache-Control":"no-store", "Access-Control-Allow-Origin":"*"})
     app.routes.remove(metadata_route)
-    app.routes.insert(0, Route("/.well-known/oauth-authorization-server", metadata_handler))
+    # Discovery clients differ in whether they retain the issuer trailing slash
+    # or use the MCP URL as their initial issuer candidate. Serve metadata directly
+    # at these aliases instead of relying on redirects or returning a 404.
+    metadata["code_challenge_methods_supported"] = ["S256"]
+    for path in ("/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/",
+                 "/.well-known/oauth-authorization-server/mcp", "/mcp/.well-known/oauth-authorization-server"):
+        app.routes.insert(0, Route(path, metadata_handler))
+
+    async def resource_metadata(request):
+        return JSONResponse({"resource":provider.resource,"authorization_servers":[metadata["issuer"]],
+            "scopes_supported":[SCOPE],"bearer_methods_supported":["header"]},
+            headers={"Cache-Control":"no-store","Access-Control-Allow-Origin":"*"})
+    for path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/"):
+        app.routes.insert(0, Route(path, resource_metadata))
 
     async def health(request):
-        return JSONResponse({"status":"ok", "service":"calorie-work-mcp", "version":"1.0.0"})
+        return JSONResponse({"status":"ok", "service":"calorie-work-mcp", "version":"1.0.1"})
 
     async def login(request):
         ticket = request.query_params.get("ticket", "")

@@ -185,3 +185,17 @@ def test_real_bridge_database_and_background_sync(tmp_path,monkeypatch):
         assert content['meal_count']==1
         assert len(sync)==1
     engine.dispose()
+
+
+def test_discovery_aliases_do_not_redirect(setup):
+    c,_,_,_=setup
+    for path in ('/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/',
+                 '/.well-known/oauth-authorization-server/mcp','/mcp/.well-known/oauth-authorization-server'):
+        r=c.get(path)
+        assert r.status_code==200,(path,r.text)
+        assert r.json()['code_challenge_methods_supported']==['S256']
+        assert r.json()['issuer']==BASE+'/'
+    for path in ('/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/'):
+        r=c.get(path)
+        assert r.status_code==200
+        assert r.json()['resource']==BASE+'/mcp'
