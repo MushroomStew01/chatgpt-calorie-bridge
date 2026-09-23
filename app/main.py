@@ -236,7 +236,11 @@ def append_meal_note(meal: Meal, message: str) -> None:
     message = (message or "").strip(" |")
     if not message:
         return
-    meal.notes = (f"{meal.notes} | {message}" if meal.notes else message)[:500]
+    # Reserve space for the latest result even when the user's notes are full.
+    message = message[:497]
+    available = 500 - len(message) - 3
+    prefix = (meal.notes or "")[:available]
+    meal.notes = f"{prefix} | {message}" if prefix else message
 
 
 def auto_sync_meal_to_fatsecret(
@@ -248,84 +252,30 @@ def auto_sync_meal_to_fatsecret(
     if not credentials:
         return None
 
-    match = fatsecret.find_best_food_match(
-        consumer_key=FATSECRET_CONSUMER_KEY,
-        consumer_secret=FATSECRET_CONSUMER_SECRET,
-        query=(search_query or meal.name),
-        calories=meal.calories,
-        protein=meal.protein,
-        carbs=meal.carbs,
-        fat=meal.fat,
-        max_search_results=FATSECRET_MAX_SEARCH_RESULTS,
-        max_detail_candidates=FATSECRET_DETAIL_CANDIDATES,
-    )
-    if match is None:
-        append_meal_note(meal, "FatSecret: no matching food found")
-        return None
-    if match.score < FATSECRET_MATCH_MIN_SCORE:
-        append_meal_note(
-            meal,
-            f"FatSecret: match confidence too low ({match.score:.2f})",
-        )
-        return None
-
+    if meal.fatsecret_entry_id:
+        return meal.fatsecret_entry_id
     access_token, access_token_secret = credentials
-    entry_id = fatsecret.create_diary_entry(
+    auth = dict(
         consumer_key=FATSECRET_CONSUMER_KEY,
         consumer_secret=FATSECRET_CONSUMER_SECRET,
         access_token=access_token,
         access_token_secret=access_token_secret,
-        food_id=match.food_id,
-        serving_id=match.serving_id,
-        number_of_units=match.number_of_units,
-        food_entry_name=meal.name,
-        meal=meal.meal_type,
-        date_int=days_since_epoch(meal.eaten_at),
-        expected_calories=meal.calories,
     )
-
-    meal.fatsecret_food_id = match.food_id
-    meal.fatsecret_serving_id = match.serving_id
-    meal.fatsecret_entry_id = entry_id
-    if entry_id:
-        append_meal_note(
-            meal,
-            (
-                f"FatSecret synced: {match.display_name}; "
-                f"{match.number_of_units:g} × {match.serving_description}; "
-                f"match {match.score:.2f}"
-            ),
-        )
-    else:
-        append_meal_note(meal, "FatSecret: diary API returned no entry id")
-    return entry_id
-
-
-def sync_explicit_fatsecret_entry(
-    db: Session,
-    meal: Meal,
-    number_of_units: float,
-) -> Optional[str]:
-    credentials = fatsecret_access_credentials(db)
-    if not credentials or not meal.fatsecret_food_id or not meal.fatsecret_serving_id:
-        return None
-    access_token, access_token_secret = credentials
+    food_id, serving_id = fatsecret.create_exact_food(
+        **auth, name=meal.name, calories=meal.calories,
+        protein=meal.protein, carbs=meal.carbs, fat=meal.fat,
+        fiber=meal.fiber, sugar=meal.sugar,
+    )
+    meal.fatsecret_food_id = food_id
+    meal.fatsecret_serving_id = serving_id
     entry_id = fatsecret.create_diary_entry(
-        consumer_key=FATSECRET_CONSUMER_KEY,
-        consumer_secret=FATSECRET_CONSUMER_SECRET,
-        access_token=access_token,
-        access_token_secret=access_token_secret,
-        food_id=meal.fatsecret_food_id,
-        serving_id=meal.fatsecret_serving_id,
-        number_of_units=number_of_units,
-        food_entry_name=meal.name,
-        meal=meal.meal_type,
-        date_int=days_since_epoch(meal.eaten_at),
+        **auth, food_id=food_id, serving_id=serving_id,
+        number_of_units=1, food_entry_name=meal.name,
+        meal=meal.meal_type, date_int=days_since_epoch(meal.eaten_at),
         expected_calories=meal.calories,
     )
     meal.fatsecret_entry_id = entry_id
-    if entry_id:
-        append_meal_note(meal, "FatSecret synced using supplied food/serving")
+    append_meal_note(meal, f"FatSecret synced: exact {meal.calories:g} kcal")
     return entry_id
 
 
@@ -338,14 +288,12 @@ def run_fatsecret_sync(
     db = SessionLocal()
     try:
         meal = db.get(Meal, meal_id)
-        if meal is None or not fatsecret_connected(db):
+        if meal is None or meal.fatsecret_entry_id or not fatsecret_connected(db):
             return
 
         try:
-            if meal.fatsecret_food_id and meal.fatsecret_serving_id:
-                sync_explicit_fatsecret_entry(db, meal, number_of_units)
-            else:
-                auto_sync_meal_to_fatsecret(db, meal, search_query)
+            # Supplied catalog IDs and search hints never override meal nutrition.
+            auto_sync_meal_to_fatsecret(db, meal, search_query)
         except fatsecret.FatSecretError as exc:
             append_meal_note(meal, f"FatSecret sync failed: {exc}")
         except Exception as exc:
@@ -367,7 +315,7 @@ def action_schema(base_url: str) -> dict:
             "title": "Calorie Bridge",
             "version": "1.6.0",
             "description": (
-                "Log estimated meals, automatically match them to FatSecret when "
+                "Log meals and sync their exact calories to FatSecret when "
                 "connected, and retrieve daily calorie totals."
             ),
         },
@@ -415,8 +363,7 @@ def action_schema(base_url: str) -> dict:
                                         "fatsecret_search_query": {
                                             "type": "string",
                                             "description": (
-                                                "Optional concise food name to improve "
-                                                "FatSecret matching; omit to use name."
+                                                "Legacy input; ignored by exact-calorie sync."
                                             ),
                                         },
                                     },
@@ -477,7 +424,8 @@ def health(db: Session = Depends(db_session)):
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
         "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",
-        "fatsecret_auto_match": True,
+        "fatsecret_auto_match": False,
+        "fatsecret_exact_calories": True,
         "fatsecret_sync_mode": "background",
         "fatsecret_match_min_score": FATSECRET_MATCH_MIN_SCORE,
         "get_meals_default_scope": "today",

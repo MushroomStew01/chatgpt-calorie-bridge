@@ -6,6 +6,7 @@ import hmac
 import secrets
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
 
@@ -23,6 +24,7 @@ AUTHORIZE_URL = "https://authentication.fatsecret.com/oauth/authorize"
 ACCESS_TOKEN_URL = "https://authentication.fatsecret.com/oauth/access_token"
 SEARCH_URL = "https://platform.fatsecret.com/rest/foods/search/v1"
 FOOD_GET_URL = "https://platform.fatsecret.com/rest/food/v5"
+FOOD_CREATE_URL = "https://platform.fatsecret.com/rest/food/v2"
 DIARY_URL = "https://platform.fatsecret.com/rest/food-entries/v1"
 
 
@@ -147,6 +149,91 @@ def _response_error(response: requests.Response) -> str:
 def _require_ok(response: requests.Response, operation: str) -> None:
     if not response.ok:
         raise FatSecretError(f"{operation}: {_response_error(response)}")
+
+
+def _json_response(response: requests.Response, operation: str) -> dict[str, Any]:
+    _require_ok(response, operation)
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise FatSecretError(f"{operation}: invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise FatSecretError(f"{operation}: invalid response")
+    if "error" in body:
+        error = body["error"]
+        if isinstance(error, dict):
+            raise FatSecretError(
+                f"{operation}: API error {error.get('code')}: {error.get('message')}"
+            )
+        raise FatSecretError(f"{operation}: API error")
+    return body
+
+
+def _decimal(value: object) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise FatSecretError("FatSecret returned an invalid calorie value") from exc
+    if not result.is_finite() or result < 0:
+        raise FatSecretError("FatSecret returned an invalid calorie value")
+    return result
+
+
+def create_exact_food(
+    *,
+    consumer_key: str,
+    consumer_secret: str,
+    access_token: str,
+    access_token_secret: str,
+    name: str,
+    calories: float,
+    protein: float,
+    carbs: float,
+    fat: float,
+    fiber: float,
+    sugar: float,
+) -> tuple[str, str]:
+    """Create one custom serving containing the entire meal's supplied nutrition."""
+    auth = dict(
+        consumer_key=consumer_key, consumer_secret=consumer_secret,
+        token=access_token, token_secret=access_token_secret,
+    )
+    body = _json_response(signed_request(
+        **auth, method="POST", url=FOOD_CREATE_URL,
+        request_parameters={
+            "food_name": name, "brand_type": "manufacturer",
+            "serving_size": "1 meal", "calories": str(_decimal(calories)),
+            "protein": protein, "carbohydrate": carbs, "fat": fat,
+            "fiber": fiber, "sugar": sugar, "format": "json",
+        },
+    ), "FatSecret custom food creation failed (food.create.v2 access required)")
+    food_id = body.get("food_id")
+    if isinstance(food_id, dict):
+        food_id = food_id.get("value")
+    if not food_id or not str(food_id).isdigit() or int(food_id) <= 0:
+        raise FatSecretError("FatSecret custom food returned no valid food id")
+    food_id = str(food_id)
+    # User-created foods must be retrieved with the user's OAuth credentials.
+    detail = _json_response(signed_request(
+        **auth, method="GET", url=FOOD_GET_URL,
+        request_parameters={"food_id": food_id, "format": "json"},
+    ), "FatSecret custom food lookup failed")
+    food = detail.get("food")
+    if not isinstance(food, dict) or not isinstance(food.get("servings"), dict):
+        raise FatSecretError("FatSecret custom food returned no servings")
+    servings = food["servings"].get("serving")
+    if isinstance(servings, dict):
+        servings = [servings]
+    for serving in servings if isinstance(servings, list) else []:
+        if not isinstance(serving, dict):
+            continue
+        serving_id = str(serving.get("serving_id") or "")
+        if not serving_id.isdigit() or int(serving_id) <= 0:
+            continue
+        if (_decimal(serving.get("calories")) == _decimal(calories)
+                and _decimal(serving.get("number_of_units")) == 1):
+            return food_id, serving_id
+    raise FatSecretError("FatSecret custom food has no one-meal serving with exact calories")
 
 
 def request_token(
@@ -288,7 +375,12 @@ def delete_diary_entry(
         token=access_token,
         token_secret=access_token_secret,
     )
-    _require_ok(response, "FatSecret diary cleanup failed")
+    body = _json_response(response, "FatSecret diary cleanup failed")
+    success = body.get("success")
+    if isinstance(success, dict):
+        success = success.get("value")
+    if str(success) != "1":
+        raise FatSecretError("FatSecret diary cleanup was not confirmed")
 
 
 def create_diary_entry(
@@ -304,7 +396,6 @@ def create_diary_entry(
     meal: str,
     date_int: int,
     expected_calories: Optional[float] = None,
-    max_calorie_error_ratio: float = 0.15,
 ) -> Optional[str]:
     response = signed_request(
         consumer_key=consumer_key,
@@ -323,53 +414,38 @@ def create_diary_entry(
         token=access_token,
         token_secret=access_token_secret,
     )
-    _require_ok(response, "FatSecret diary sync failed")
-
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise FatSecretError("FatSecret diary sync returned invalid JSON") from exc
-
-    entry = body.get("food_entries", {}).get("food_entry")
+    body = _json_response(response, "FatSecret diary sync failed")
+    entries = body.get("food_entries")
+    entry = entries.get("food_entry") if isinstance(entries, dict) else None
     if isinstance(entry, list):
-        entry = entry[0] if entry else None
+        entry = entry[0] if len(entry) == 1 else None
     if not isinstance(entry, dict):
-        return None
+        raise FatSecretError("FatSecret diary write outcome unknown: no unique entry; check diary before retrying")
 
     entry_id = str(entry.get("food_entry_id") or "") or None
-    actual_calories = 0.0
+    if not entry_id:
+        raise FatSecretError("FatSecret diary write outcome unknown: missing entry id; check diary before retrying")
     try:
-        actual_calories = float(entry.get("calories") or 0)
-    except (TypeError, ValueError):
-        actual_calories = 0.0
-
-    # FatSecret returns the calories it actually recorded. Validate that value
-    # against the ChatGPT/photo estimate so a bad match can never silently turn
-    # a 950 kcal meal into a 260 kcal diary entry again.
-    if expected_calories and expected_calories > 0 and actual_calories > 0:
-        error_ratio = abs(actual_calories - expected_calories) / expected_calories
-        if error_ratio > max_calorie_error_ratio:
-            cleanup_error = None
-            if entry_id:
-                try:
-                    delete_diary_entry(
-                        consumer_key=consumer_key,
-                        consumer_secret=consumer_secret,
-                        access_token=access_token,
-                        access_token_secret=access_token_secret,
-                        food_entry_id=entry_id,
-                    )
-                except FatSecretError as exc:
-                    cleanup_error = str(exc)
-
-            detail = (
-                f"FatSecret recorded {actual_calories:.0f} kcal for a "
-                f"{expected_calories:.0f} kcal estimate"
+        actual_calories = _decimal(entry.get("calories"))
+    except FatSecretError:
+        actual_calories = None
+    if expected_calories is not None and (
+        actual_calories is None or actual_calories != _decimal(expected_calories)
+    ):
+        detail = (
+            f"FatSecret entry {entry_id} recorded {actual_calories} kcal; "
+            f"expected exactly {expected_calories} kcal"
+        )
+        try:
+            delete_diary_entry(
+                consumer_key=consumer_key, consumer_secret=consumer_secret,
+                access_token=access_token, access_token_secret=access_token_secret,
+                food_entry_id=entry_id,
             )
-            if cleanup_error:
-                detail += f"; automatic cleanup also failed: {cleanup_error}"
-            else:
-                detail += "; incorrect FatSecret entry was removed"
-            raise FatSecretError(detail)
+        except (FatSecretError, requests.RequestException) as exc:
+            detail += f"; cleanup unconfirmed ({type(exc).__name__}); check diary before retrying"
+        else:
+            detail += "; incorrect FatSecret entry was removed"
+        raise FatSecretError(detail)
 
     return entry_id

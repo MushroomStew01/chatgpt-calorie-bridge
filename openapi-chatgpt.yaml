@@ -33,7 +33,7 @@ paths:
                 eaten_at: { type: string, format: date-time }
                 fatsecret_search_query:
                   type: string
-                  description: Optional concise food name to improve FatSecret matching; omit to use name.
+                  description: Legacy input; ignored by exact-calorie sync.
       responses:
         "200": { description: Meal logged }
     get:
