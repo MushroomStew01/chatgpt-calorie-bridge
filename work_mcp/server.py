@@ -353,8 +353,8 @@ def build_app(config, transport=None):
                     "MCP request method=%s path=%s status=%s",
                     safe_method, safe_path, message["status"],
                 )
-                message.setdefault("headers",[]).extend([(b"cache-control",b"no-store"),(b"referrer-policy",b"no-referrer"),
-                    (b"x-content-type-options",b"nosniff"),(b"content-security-policy",b"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")])
+                message.setdefault("headers",[]).extend([(b"cache-control",b"no-store"),(b"referrer-policy",b"strict-origin"),
+                    (b"x-content-type-options",b"nosniff"),(b"content-security-policy",b"default-src 'none'; form-action 'self' https://chatgpt.com; frame-ancestors 'none'; base-uri 'none'")])
             await send(message)
         await inner(scope,receive,safe_send)
     return secured

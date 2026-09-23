@@ -48,6 +48,8 @@ def login(client):
     ticket=parse_qs(urlsplit(r.headers['location']).query)['ticket'][0]
     r=client.get(r.headers['location'])
     assert r.status_code == 200,r.text
+    assert r.headers['referrer-policy'] == 'strict-origin'
+    assert "form-action 'self' https://chatgpt.com;" in r.headers['content-security-policy']
     csrf=client.cookies.get('__Host-calorie-csrf')
     data={'ticket':ticket,'csrf':csrf,'username':'andy','password':'password'}
     assert client.post('/approve',data=data,headers={'Origin':'https://evil.example'}).status_code == 403
