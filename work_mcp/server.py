@@ -2,6 +2,7 @@
 import hashlib
 import html
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -248,7 +249,7 @@ def build_app(config, transport=None):
         app.routes.insert(0, Route(path, resource_metadata))
 
     async def health(request):
-        return JSONResponse({"status":"ok", "service":"calorie-work-mcp", "version":"1.0.1"})
+        return JSONResponse({"status":"ok", "service":"calorie-work-mcp", "version":"1.0.2"})
 
     async def login(request):
         ticket = request.query_params.get("ticket", "")
@@ -339,8 +340,19 @@ def build_app(config, transport=None):
     async def secured(scope, receive, send):
         if scope["type"] != "http":
             return await inner(scope,receive,send)
+        # Log only fixed route labels. Never log a raw URL, query string,
+        # headers, body, credentials, authorization codes or arbitrary paths.
+        path = scope.get("path", "")
+        known_paths = {getattr(route, "path", "") for route in app.routes}
+        safe_path = path if path in known_paths else "<other>"
+        method = scope.get("method", "")
+        safe_method = method if method in {"GET", "POST", "HEAD", "OPTIONS", "DELETE", "PUT", "PATCH"} else "OTHER"
         async def safe_send(message):
             if message["type"] == "http.response.start":
+                logging.getLogger("uvicorn.error").info(
+                    "MCP request method=%s path=%s status=%s",
+                    safe_method, safe_path, message["status"],
+                )
                 message.setdefault("headers",[]).extend([(b"cache-control",b"no-store"),(b"referrer-policy",b"no-referrer"),
                     (b"x-content-type-options",b"nosniff"),(b"content-security-policy",b"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")])
             await send(message)

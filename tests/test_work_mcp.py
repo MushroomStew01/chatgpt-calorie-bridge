@@ -199,3 +199,16 @@ def test_discovery_aliases_do_not_redirect(setup):
         r=c.get(path)
         assert r.status_code==200
         assert r.json()['resource']==BASE+'/mcp'
+
+
+def test_request_diagnostics_exclude_secrets_and_unknown_paths(setup,caplog):
+    import logging
+    c,_,_,_=setup
+    with caplog.at_level(logging.INFO,logger='uvicorn.error'):
+        c.get('/.well-known/oauth-authorization-server?token=never-log-this',headers={'Authorization':'Bearer secret-header'})
+        c.get('/secret-path-value?code=secret-code')
+    messages='\n'.join(r.getMessage() for r in caplog.records if r.name=='uvicorn.error')
+    assert 'path=/.well-known/oauth-authorization-server status=200' in messages
+    assert 'path=<other> status=404' in messages
+    for secret in ('never-log-this','secret-header','secret-path-value','secret-code'):
+        assert secret not in messages
