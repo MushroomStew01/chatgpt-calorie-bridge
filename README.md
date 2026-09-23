@@ -1,5 +1,7 @@
 # ChatGPT Calorie Bridge
 
+For the Raspberry Pi phone-photo workflow, see [Mobile photo logging](docs/MOBILE_PHOTO_LOGGING.md). Check the existing-GPT prerequisite first; a connected desktop-only plugin does not establish mobile support.
+
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2FMushroomStew01%2Fchatgpt-calorie-bridge)
 
 A small FastAPI service for the workflow:

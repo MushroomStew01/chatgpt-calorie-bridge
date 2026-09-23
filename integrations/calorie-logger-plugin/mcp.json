@@ -3,7 +3,7 @@
   "mcpServers": {
     "calorie-pi": {
       "type": "streamable-http",
-      "url": "https://stewytailscale.tail93bb57.ts.net:8443/mcp"
+      "url": "https://stewytailscale.tail93bb57.ts.net/mcp"
     }
   }
 }

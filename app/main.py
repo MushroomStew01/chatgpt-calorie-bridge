@@ -486,7 +486,7 @@ def health(db: Session = Depends(db_session)):
 
 @app.get("/action-openapi.json", include_in_schema=False)
 def action_openapi(request: Request):
-    return JSONResponse(action_schema(str(request.base_url)))
+    return JSONResponse(action_schema(public_base_url(request)))
 
 
 @app.get("/fatsecret/connect", include_in_schema=False)

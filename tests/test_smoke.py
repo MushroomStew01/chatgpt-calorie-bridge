@@ -122,3 +122,16 @@ def test_dynamic_action_schema():
     assert "fatsecret_search_query" in props
     assert body["components"]["schemas"] == {}
     assert body["components"]["securitySchemes"]["ApiKeyAuth"]["name"] == "X-API-Key"
+
+
+def test_action_schema_uses_configured_public_origin(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://calorie.example")
+    response = client.get("/action-openapi.json")
+    assert response.json()["servers"] == [{"url": "https://calorie.example"}]
+
+
+def test_action_schema_falls_back_to_request_origin(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+    assert client.get("/action-openapi.json").json()["servers"] == [{"url": "http://testserver"}]
