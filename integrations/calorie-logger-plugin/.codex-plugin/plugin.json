@@ -1,0 +1,20 @@
+{
+  "name": "gpt-4a4422e356bf5db2d001364f7b39b935",
+  "version": "0.6.0",
+  "description": "Log meals and retrieve daily totals from your Raspberry Pi calorie bridge.",
+  "author": {
+    "name": "Andy Kuk"
+  },
+  "interface": {
+    "capabilities": [
+      "skills"
+    ],
+    "category": "Other",
+    "defaultPrompt": [],
+    "developerName": "Andy Kuk",
+    "displayName": "Calorie Logger",
+    "longDescription": "Log meals to your Raspberry Pi and read actual daily totals using an authenticated MCP connection.",
+    "shortDescription": "Calorie logging with your Raspberry Pi."
+  },
+  "skills": "./skills/"
+}
