@@ -38,6 +38,12 @@ class FatSecretError(RuntimeError):
     pass
 
 
+class FatSecretAPIError(FatSecretError):
+    def __init__(self, code):
+        self.code = str(code)
+        super().__init__(f"FatSecret API error {self.code}")
+
+
 def percent(value: object) -> str:
     return quote(str(value), safe="~-._")
 
@@ -148,6 +154,8 @@ def _response_error(response: requests.Response) -> str:
 
 def _require_ok(response: requests.Response, operation: str) -> None:
     if not response.ok:
+        if response.status_code in {400, 401, 403, 404, 405, 422, 429}:
+            raise FatSecretAPIError(f"HTTP{response.status_code}")
         raise FatSecretError(f"{operation}: {_response_error(response)}")
 
 
@@ -162,9 +170,7 @@ def _json_response(response: requests.Response, operation: str) -> dict[str, Any
     if "error" in body:
         error = body["error"]
         if isinstance(error, dict):
-            raise FatSecretError(
-                f"{operation}: API error {error.get('code')}: {error.get('message')}"
-            )
+            raise FatSecretAPIError(error.get('code'))
         raise FatSecretError(f"{operation}: API error")
     return body
 
@@ -381,6 +387,56 @@ def delete_diary_entry(
         success = success.get("value")
     if str(success) != "1":
         raise FatSecretError("FatSecret diary cleanup was not confirmed")
+
+
+def read_diary_entries(*, consumer_key, consumer_secret, access_token,
+                       access_token_secret, date_int):
+    body = _json_response(signed_request(
+        consumer_key=consumer_key, consumer_secret=consumer_secret,
+        token=access_token, token_secret=access_token_secret,
+        method="GET", url="https://platform.fatsecret.com/rest/food-entries/v2",
+        request_parameters={"date": date_int, "format": "json"}, timeout=8,
+    ), "FatSecret diary verification failed")
+    container = body.get("food_entries")
+    if container is None:
+        raise FatSecretError("FatSecret diary response is missing food_entries")
+    if container in ("", []):
+        return []
+    if not isinstance(container, dict):
+        raise FatSecretError("FatSecret diary response is invalid")
+    entries = container.get("food_entry", [])
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+        raise FatSecretError("FatSecret diary entries are invalid")
+    return entries
+
+
+def post_diary_entry(*, consumer_key, consumer_secret, access_token,
+                     access_token_secret, food_id, serving_id, food_entry_name,
+                     meal, date_int):
+    """POST exactly once. The outbox persists identity before calling this.
+
+    A returned ID is only a candidate; independent GET verification is mandatory.
+    """
+    body = _json_response(signed_request(
+        consumer_key=consumer_key, consumer_secret=consumer_secret,
+        token=access_token, token_secret=access_token_secret,
+        method="POST", url=DIARY_URL,
+        request_parameters={"food_id": food_id, "serving_id": serving_id,
+                            "food_entry_name": food_entry_name, "number_of_units": 1,
+                            "meal": meal, "date": date_int, "format": "json"},
+    ), "FatSecret diary write failed")
+    value = body.get("food_entry_id")
+    if isinstance(value, dict):
+        value = value.get("value")
+    entries = body.get("food_entries", {})
+    entries = entries.get("food_entry") if isinstance(entries, dict) else None
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not value and isinstance(entries, list) and len(entries) == 1:
+        value = entries[0].get("food_entry_id") if isinstance(entries[0], dict) else None
+    return str(value) if str(value).isdigit() and int(value) > 0 else None
 
 
 def create_diary_entry(

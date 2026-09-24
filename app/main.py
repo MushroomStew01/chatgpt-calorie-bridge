@@ -1,5 +1,6 @@
 import os
 import secrets
+from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,7 +12,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Float, Integer, String, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app import fatsecret
@@ -92,9 +93,35 @@ class FatSecretConnection(Base):
     )
 
 
+class SyncJob(Base):
+    __tablename__ = "fatsecret_sync_jobs"
+    meal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    marker: Mapped[str] = mapped_column(String(32), unique=True)
+    state: Mapped[str] = mapped_column(String(30), default="pending")
+    error: Mapped[str] = mapped_column(String(500), default="")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    food_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    write_started: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    lease: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.6.0")
+
+@asynccontextmanager
+async def lifespan(app):
+    from app.sync import start_worker
+    stop, thread = start_worker()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.7.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -105,12 +132,12 @@ dashboard_security = HTTPBasic(auto_error=False)
 
 class MealCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    calories: float = Field(ge=0)
-    protein: float = Field(default=0, ge=0)
-    carbs: float = Field(default=0, ge=0)
-    fat: float = Field(default=0, ge=0)
-    fiber: float = Field(default=0, ge=0)
-    sugar: float = Field(default=0, ge=0)
+    calories: float = Field(ge=0, allow_inf_nan=False)
+    protein: float = Field(default=0, ge=0, allow_inf_nan=False)
+    carbs: float = Field(default=0, ge=0, allow_inf_nan=False)
+    fat: float = Field(default=0, ge=0, allow_inf_nan=False)
+    fiber: float = Field(default=0, ge=0, allow_inf_nan=False)
+    sugar: float = Field(default=0, ge=0, allow_inf_nan=False)
     meal_type: str = Field(default="other", pattern="^(breakfast|lunch|dinner|other)$")
     notes: str = Field(default="", max_length=500)
     eaten_at: Optional[datetime] = None
@@ -134,8 +161,14 @@ class MealOut(BaseModel):
     meal_type: str
     notes: str
     fatsecret_entry_id: Optional[str] = None
+    sync: Optional[dict] = None
 
     model_config = {"from_attributes": True}
+
+
+def meal_payload(db, meal):
+    from app.sync import status
+    return {**MealOut.model_validate(meal).model_dump(), "sync": status(db, meal)}
 
 
 def db_session():
@@ -243,77 +276,17 @@ def append_meal_note(meal: Meal, message: str) -> None:
     meal.notes = f"{prefix} | {message}" if prefix else message
 
 
-def auto_sync_meal_to_fatsecret(
-    db: Session,
-    meal: Meal,
-    search_query: Optional[str],
-) -> Optional[str]:
-    credentials = fatsecret_access_credentials(db)
-    if not credentials:
-        return None
-
-    if meal.fatsecret_entry_id:
-        return meal.fatsecret_entry_id
-    access_token, access_token_secret = credentials
-    auth = dict(
-        consumer_key=FATSECRET_CONSUMER_KEY,
-        consumer_secret=FATSECRET_CONSUMER_SECRET,
-        access_token=access_token,
-        access_token_secret=access_token_secret,
-    )
-    food_id, serving_id = fatsecret.create_exact_food(
-        **auth, name=meal.name, calories=meal.calories,
-        protein=meal.protein, carbs=meal.carbs, fat=meal.fat,
-        fiber=meal.fiber, sugar=meal.sugar,
-    )
-    meal.fatsecret_food_id = food_id
-    meal.fatsecret_serving_id = serving_id
-    entry_id = fatsecret.create_diary_entry(
-        **auth, food_id=food_id, serving_id=serving_id,
-        number_of_units=1, food_entry_name=meal.name,
-        meal=meal.meal_type, date_int=days_since_epoch(meal.eaten_at),
-        expected_calories=meal.calories,
-    )
-    meal.fatsecret_entry_id = entry_id
-    append_meal_note(meal, f"FatSecret synced: exact {meal.calories:g} kcal")
-    return entry_id
-
-
-def run_fatsecret_sync(
-    meal_id: int,
-    search_query: Optional[str],
-    number_of_units: float,
-) -> None:
-    """Best-effort FatSecret sync after the API response has already been sent."""
-    db = SessionLocal()
-    try:
-        meal = db.get(Meal, meal_id)
-        if meal is None or meal.fatsecret_entry_id or not fatsecret_connected(db):
-            return
-
-        try:
-            # Supplied catalog IDs and search hints never override meal nutrition.
-            auto_sync_meal_to_fatsecret(db, meal, search_query)
-        except fatsecret.FatSecretError as exc:
-            append_meal_note(meal, f"FatSecret sync failed: {exc}")
-        except Exception as exc:
-            append_meal_note(meal, f"FatSecret sync failed: {type(exc).__name__}")
-        db.commit()
-    finally:
-        db.close()
-
-
 def meal_query_for_day(day: date):
     start, end = day_bounds(day)
     return select(Meal).where(Meal.eaten_at >= start, Meal.eaten_at < end)
 
 
 def action_schema(base_url: str) -> dict:
-    return {
+    schema = {
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.6.0",
+            "version": "1.7.0",
             "description": (
                 "Log meals and sync their exact calories to FatSecret when "
                 "connected, and retrieve daily calorie totals."
@@ -414,19 +387,36 @@ def action_schema(base_url: str) -> dict:
             },
         },
     }
+    schema["paths"]["/api/meals/{meal_id}/verification"] = {"get": {
+        "operationId": "getMealSyncStatus",
+        "summary": "Mandatory after logging: check Pi and FatSecret separately; only verified confirms sync",
+        "security": [{"ApiKeyAuth": []}],
+        "parameters": [{"in": "path", "name": "meal_id", "required": True,
+                        "schema": {"type": "integer", "minimum": 1}}],
+        "responses": {"200": {"description": "Local save and FatSecret read-back status"}},
+    }}
+    schema["paths"]["/api/meals/{meal_id}/retry-sync"] = {"post": {
+        "operationId": "retryMealSync",
+        "summary": "Retry sync for an existing meal without logging a duplicate",
+        "security": [{"ApiKeyAuth": []}],
+        "parameters": [{"in": "path", "name": "meal_id", "required": True,
+                        "schema": {"type": "integer", "minimum": 1}}],
+        "responses": {"200": {"description": "Sync queued or manual review required"}},
+    }}
+    return schema
 
 
 @app.get("/health")
 def health(db: Session = Depends(db_session)):
     return {
         "status": "ok",
-        "api_version": "1.6.0",
+        "api_version": "1.7.0",
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
         "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",
         "fatsecret_auto_match": False,
         "fatsecret_exact_calories": True,
-        "fatsecret_sync_mode": "background",
+        "fatsecret_sync_mode": "durable-outbox-readback",
         "fatsecret_match_min_score": FATSECRET_MATCH_MIN_SCORE,
         "get_meals_default_scope": "today",
     }
@@ -434,7 +424,7 @@ def health(db: Session = Depends(db_session)):
 
 @app.get("/action-openapi.json", include_in_schema=False)
 def action_openapi(request: Request):
-    return JSONResponse(action_schema(str(request.base_url)))
+    return JSONResponse(action_schema(public_base_url(request)))
 
 
 @app.get("/fatsecret/connect", include_in_schema=False)
@@ -554,25 +544,14 @@ def create_meal(
         fatsecret_food_id=payload.fatsecret_food_id,
         fatsecret_serving_id=payload.fatsecret_serving_id,
     )
+    from app.sync import enqueue
+    # Meal and job commit together. A restart cannot lose queued sync work.
     db.add(meal)
+    db.flush()
+    enqueue(db, meal)
     db.commit()
     db.refresh(meal)
-
-    # The local database is the source of truth. Never make the ChatGPT action
-    # wait for several downstream FatSecret API calls; that caused outbound-call
-    # timeouts. Queue the optional mirror after the response instead.
-    if fatsecret_connected(db):
-        append_meal_note(meal, "FatSecret sync queued")
-        db.commit()
-        db.refresh(meal)
-        background_tasks.add_task(
-            run_fatsecret_sync,
-            meal.id,
-            payload.fatsecret_search_query,
-            payload.fatsecret_number_of_units,
-        )
-
-    return meal
+    return meal_payload(db, meal)
 
 
 @app.get(
@@ -589,7 +568,40 @@ def list_meals(
     # response-size limit. Default to today and hard-cap the response.
     selected = day or local_today()
     stmt = meal_query_for_day(selected).order_by(Meal.eaten_at.desc()).limit(limit)
-    return list(db.scalars(stmt).all())
+    return [meal_payload(db, meal) for meal in db.scalars(stmt).all()]
+
+
+@app.get("/api/meals/{meal_id}/verification", dependencies=[Depends(require_api_key)])
+def verify_meal(meal_id: int, db: Session = Depends(db_session)):
+    from app.sync import process, status
+    meal = db.get(Meal, meal_id)
+    if meal is None:
+        raise HTTPException(404, "Meal not found")
+    job = db.get(SyncJob, meal_id)
+    # Existing writes are checked against the provider. This endpoint never
+    # creates a food or diary entry. Pending jobs are handled by the worker.
+    if job and (job.write_started or meal.fatsecret_entry_id):
+        process(meal_id, force=True)
+        db.expire_all()
+        meal = db.get(Meal, meal_id)
+    return {"meal": meal_payload(db, meal), **status(db, meal)}
+
+
+@app.post("/api/meals/{meal_id}/retry-sync", dependencies=[Depends(require_api_key)])
+def retry_sync(meal_id: int, db: Session = Depends(db_session)):
+    from app.sync import enqueue, now, status
+    meal = db.get(Meal, meal_id)
+    if meal is None:
+        raise HTTPException(404, "Meal not found")
+    job = db.get(SyncJob, meal_id)
+    if job is None:
+        # Old writes had no correlation marker. Never blindly replay them.
+        job = enqueue(db, meal, legacy=True)
+    elif job.state not in {"verified", "needs_review"}:
+        job.state = "verifying" if job.write_started else "pending"
+        job.next_attempt = now()
+    db.commit()
+    return status(db, meal)
 
 
 @app.get("/api/summary", dependencies=[Depends(require_api_key)])
@@ -644,10 +656,13 @@ def dashboard(
         "carbs": round(sum(m.carbs for m in meals), 1),
         "fat": round(sum(m.fat for m in meals), 1),
     }
+    from app.sync import status
+    sync_states = {m.id: status(db, m)["fatsecret"] for m in meals}
     return templates.get_template("dashboard.html").render(
         request=request,
         selected=selected,
         meals=meals,
+        sync_states=sync_states,
         totals=totals,
         fatsecret_keys_configured=fatsecret_keys_configured(),
         fatsecret_connected=fatsecret_connected(db),

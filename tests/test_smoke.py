@@ -25,13 +25,13 @@ def test_health():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["api_version"] == "1.6.0"
+    assert body["api_version"] == "1.7.0"
     assert body["fatsecret_keys_configured"] is False
     assert body["fatsecret_connected"] is False
     assert body["fatsecret_oauth_signer"] == "manual-rfc3986-hmac-sha1"
     assert body["fatsecret_auto_match"] is False
     assert body["fatsecret_exact_calories"] is True
-    assert body["fatsecret_sync_mode"] == "background"
+    assert body["fatsecret_sync_mode"] == "durable-outbox-readback"
     assert body["get_meals_default_scope"] == "today"
 
 
@@ -125,58 +125,14 @@ def test_dynamic_action_schema():
     assert body["components"]["securitySchemes"]["ApiKeyAuth"]["name"] == "X-API-Key"
 
 
-def test_background_sync_uses_exact_food_even_with_catalog_ids(monkeypatch):
-    from unittest.mock import Mock
+def test_action_schema_uses_configured_public_origin(monkeypatch):
     from app import main
-
-    monkeypatch.setattr(main, "fatsecret_connected", lambda db: True)
-    monkeypatch.setattr(main, "fatsecret_access_credentials", lambda db: ("token", "secret"))
-    search = Mock(side_effect=AssertionError("Exact sync must not search"))
-    custom = Mock(return_value=("900", "901"))
-    diary = Mock(return_value="902")
-    monkeypatch.setattr(fatsecret, "find_best_food_match", search)
-    monkeypatch.setattr(fatsecret, "create_exact_food", custom)
-    monkeypatch.setattr(fatsecret, "create_diary_entry", diary)
-    result = client.post("/api/meals", headers=API_HEADERS, json={
-        "name": "Pizza - 3 slices", "calories": 540, "protein": 24,
-        "carbs": 66, "fat": 20, "fiber": 4, "sugar": 6,
-        "eaten_at": "2026-09-23T00:30:00Z",
-        "fatsecret_food_id": "old", "fatsecret_serving_id": "old-serving",
-        "fatsecret_number_of_units": 99,
-    })
-    assert result.status_code == 200
-    meal_id = result.json()["id"]
-    with main.SessionLocal() as db:
-        meal = db.get(main.Meal, meal_id)
-        assert meal.calories == 540
-        assert meal.fatsecret_entry_id == "902"
-        assert "exact 540 kcal" in meal.notes
-    assert custom.call_args.kwargs["calories"] == 540
-    assert diary.call_args.kwargs["expected_calories"] == 540
-    assert diary.call_args.kwargs["number_of_units"] == 1
-    assert diary.call_args.kwargs["food_id"] == "900"
-    from datetime import date
-    assert diary.call_args.kwargs["date_int"] == (date(2026, 9, 22) - date(1970, 1, 1)).days
-    main.run_fatsecret_sync(meal_id, None, 1)
-    assert diary.call_count == 1
-    search.assert_not_called()
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://calorie.example")
+    response = client.get("/action-openapi.json")
+    assert response.json()["servers"] == [{"url": "https://calorie.example"}]
 
 
-def test_background_failure_preserves_local_meal_and_visible_error(monkeypatch):
-    from unittest.mock import Mock
+def test_action_schema_falls_back_to_request_origin(monkeypatch):
     from app import main
-
-    monkeypatch.setattr(main, "fatsecret_connected", lambda db: True)
-    monkeypatch.setattr(main, "fatsecret_access_credentials", lambda db: ("token", "secret"))
-    monkeypatch.setattr(fatsecret, "create_exact_food", Mock(
-        side_effect=fatsecret.FatSecretError("API error 13: Permission denied")))
-    result = client.post("/api/meals", headers=API_HEADERS, json={
-        "name": "Pizza", "calories": 540, "notes": "x" * 500,
-    })
-    assert result.status_code == 200
-    with main.SessionLocal() as db:
-        meal = db.get(main.Meal, result.json()["id"])
-        assert meal.calories == 540
-        assert meal.fatsecret_entry_id is None
-        assert "FatSecret sync failed: API error 13: Permission denied" in meal.notes
-        assert len(meal.notes) <= 500
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "")
+    assert client.get("/action-openapi.json").json()["servers"] == [{"url": "http://testserver"}]
