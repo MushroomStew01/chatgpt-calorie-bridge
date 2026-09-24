@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import secrets
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -36,6 +37,13 @@ class TokenPair:
 
 class FatSecretError(RuntimeError):
     pass
+
+
+class FatSecretAPIError(FatSecretError):
+    def __init__(self, code):
+        self.code = str(code)
+        self.operation = None
+        super().__init__(f"FatSecret API error {self.code}")
 
 
 def percent(value: object) -> str:
@@ -148,6 +156,8 @@ def _response_error(response: requests.Response) -> str:
 
 def _require_ok(response: requests.Response, operation: str) -> None:
     if not response.ok:
+        if response.status_code in {400, 401, 403, 404, 405, 422, 429}:
+            raise FatSecretAPIError(f"HTTP{response.status_code}")
         raise FatSecretError(f"{operation}: {_response_error(response)}")
 
 
@@ -162,9 +172,7 @@ def _json_response(response: requests.Response, operation: str) -> dict[str, Any
     if "error" in body:
         error = body["error"]
         if isinstance(error, dict):
-            raise FatSecretError(
-                f"{operation}: API error {error.get('code')}: {error.get('message')}"
-            )
+            raise FatSecretAPIError(error.get('code'))
         raise FatSecretError(f"{operation}: API error")
     return body
 
@@ -177,6 +185,27 @@ def _decimal(value: object) -> Decimal:
     if not result.is_finite() or result < 0:
         raise FatSecretError("FatSecret returned an invalid calorie value")
     return result
+
+
+def platform_json(*, api_method: str, **kwargs) -> dict[str, Any]:
+    """Use the documented method form only after an unknown-method rejection.
+
+    Never replay a timeout or ambiguous write. Sign the alternate URL and its
+    method parameter afresh; this is not a retry with stale OAuth parameters.
+    """
+    try:
+        try:
+            return _json_response(signed_request(**kwargs), api_method)
+        except FatSecretAPIError as exc:
+            if exc.code != "10":
+                raise
+        alternate = {**kwargs, "url": "https://platform.fatsecret.com/rest/server.api",
+                     "request_parameters": {**kwargs.get("request_parameters", {}),
+                                            "method": api_method}}
+        return _json_response(signed_request(**alternate), api_method)
+    except FatSecretAPIError as exc:
+        exc.operation = api_method
+        raise
 
 
 def create_exact_food(
@@ -198,7 +227,7 @@ def create_exact_food(
         consumer_key=consumer_key, consumer_secret=consumer_secret,
         token=access_token, token_secret=access_token_secret,
     )
-    body = _json_response(signed_request(
+    body = platform_json(api_method="food.create.v2",
         **auth, method="POST", url=FOOD_CREATE_URL,
         request_parameters={
             "food_name": name, "brand_type": "manufacturer",
@@ -206,7 +235,7 @@ def create_exact_food(
             "protein": protein, "carbohydrate": carbs, "fat": fat,
             "fiber": fiber, "sugar": sugar, "format": "json",
         },
-    ), "FatSecret custom food creation failed (food.create.v2 access required)")
+    )
     food_id = body.get("food_id")
     if isinstance(food_id, dict):
         food_id = food_id.get("value")
@@ -214,10 +243,10 @@ def create_exact_food(
         raise FatSecretError("FatSecret custom food returned no valid food id")
     food_id = str(food_id)
     # User-created foods must be retrieved with the user's OAuth credentials.
-    detail = _json_response(signed_request(
+    detail = platform_json(api_method="food.get.v5",
         **auth, method="GET", url=FOOD_GET_URL,
         request_parameters={"food_id": food_id, "format": "json"},
-    ), "FatSecret custom food lookup failed")
+    )
     food = detail.get("food")
     if not isinstance(food, dict) or not isinstance(food.get("servings"), dict):
         raise FatSecretError("FatSecret custom food returned no servings")
@@ -302,6 +331,7 @@ def find_best_food_match(
     fat: float = 0.0,
     max_search_results: int = 12,
     max_detail_candidates: int = 6,
+    generic_only: bool = False,
 ) -> Optional[FatSecretMatch]:
     query = (query or "").strip()
     if not query:
@@ -343,6 +373,9 @@ def find_best_food_match(
         except (ValueError, TypeError):
             return None
 
+    if generic_only:
+        search_results = [food for food in search_results
+                          if str(food.get("food_type", "")).lower() == "generic"]
     return choose_best_match(
         query,
         search_results,
@@ -353,6 +386,26 @@ def find_best_food_match(
         target_fat=fat,
         max_detail_candidates=max(1, min(10, int(max_detail_candidates))),
     )
+
+
+def find_catalog_fallback(*, name, calories, protein, carbs, fat, consumer_key, consumer_secret):
+    """Use a related scalable catalog food; diary read-back remains authoritative."""
+    clean = re.split(r"\s+(?:with|—|–)\s+|\(", name, maxsplit=1, flags=re.I)[0].strip()
+    clean = re.sub(r"\b(?:most|slice|slices|portion|eaten|large|small)\b", "", clean, flags=re.I).strip()
+    queries = [name, clean]
+    if "sunchips" in name.lower().replace(" ", ""):
+        queries += ["multigrain chips"]
+    if "cake" in name.lower():
+        queries += ["chocolate cake" if "chocolate" in name.lower() else "cake"]
+    if "shawarma" in name.lower() and "rice" in name.lower():
+        queries += ["chicken and rice"]
+    for query in dict.fromkeys(q for q in queries if q):
+        match = find_best_food_match(consumer_key=consumer_key, consumer_secret=consumer_secret,
+            query=query, calories=calories, protein=protein, carbs=carbs, fat=fat,
+            max_search_results=20, max_detail_candidates=6, generic_only=True)
+        if match and match.score >= 0.32 and match.food_type.lower() == "generic":
+            return match
+    raise FatSecretError("No related scalable catalog food found; local meal is safe")
 
 
 def delete_diary_entry(
@@ -381,6 +434,56 @@ def delete_diary_entry(
         success = success.get("value")
     if str(success) != "1":
         raise FatSecretError("FatSecret diary cleanup was not confirmed")
+
+
+def read_diary_entries(*, consumer_key, consumer_secret, access_token,
+                       access_token_secret, date_int):
+    body = platform_json(api_method="food_entries.get.v2",
+        consumer_key=consumer_key, consumer_secret=consumer_secret,
+        token=access_token, token_secret=access_token_secret,
+        method="GET", url="https://platform.fatsecret.com/rest/food-entries/v2",
+        request_parameters={"date": date_int, "format": "json"}, timeout=8,
+    )
+    container = body.get("food_entries")
+    if container is None:
+        raise FatSecretError("FatSecret diary response is missing food_entries")
+    if container in ("", []):
+        return []
+    if not isinstance(container, dict):
+        raise FatSecretError("FatSecret diary response is invalid")
+    entries = container.get("food_entry", [])
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+        raise FatSecretError("FatSecret diary entries are invalid")
+    return entries
+
+
+def post_diary_entry(*, consumer_key, consumer_secret, access_token,
+                     access_token_secret, food_id, serving_id, food_entry_name,
+                     meal, date_int, number_of_units=1):
+    """POST exactly once. The outbox persists identity before calling this.
+
+    A returned ID is only a candidate; independent GET verification is mandatory.
+    """
+    body = platform_json(api_method="food_entry.create",
+        consumer_key=consumer_key, consumer_secret=consumer_secret,
+        token=access_token, token_secret=access_token_secret,
+        method="POST", url=DIARY_URL,
+        request_parameters={"food_id": food_id, "serving_id": serving_id,
+                            "food_entry_name": food_entry_name, "number_of_units": number_of_units,
+                            "meal": meal, "date": date_int, "format": "json"},
+    )
+    value = body.get("food_entry_id")
+    if isinstance(value, dict):
+        value = value.get("value")
+    entries = body.get("food_entries", {})
+    entries = entries.get("food_entry") if isinstance(entries, dict) else None
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not value and isinstance(entries, list) and len(entries) == 1:
+        value = entries[0].get("food_entry_id") if isinstance(entries[0], dict) else None
+    return str(value) if str(value).isdigit() and int(value) > 0 else None
 
 
 def create_diary_entry(
