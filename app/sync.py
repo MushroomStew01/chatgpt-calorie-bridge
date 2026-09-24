@@ -33,14 +33,18 @@ def enqueue(db, meal, legacy=False):
 
 
 def status(db, meal):
-    from app.main import SyncJob
+    from app.main import SyncJob, SyncPreparation
     job = db.get(SyncJob, meal.id)
+    prepared = db.get(SyncPreparation, meal.id)
     return {"local_saved": True, "meal_id": meal.id, "fatsecret": {
         "status": job.state if job else "unverified",
         "entry_id": meal.fatsecret_entry_id,
         "verified_at": job.verified_at.isoformat() if job and job.verified_at else None,
         "error": job.error if job else "Legacy entry has not been verified by the new sync worker.",
         "attempts": job.attempts if job else 0,
+        "nutrition_mode": prepared.mode if prepared else "custom",
+        "catalog_food": prepared.catalog_name if prepared and prepared.mode == "catalog" else None,
+        "nutrition_note": "Calories verified against the Pi; catalog macros may differ." if prepared and prepared.mode == "catalog" and job.state == "verified" else None,
     }}
 
 
@@ -89,7 +93,7 @@ def reconcile(db, meal, job, credentials):
 
 
 def process(meal_id, force=False):
-    from app.main import SessionLocal, Meal, SyncJob, days_since_epoch
+    from app.main import SessionLocal, Meal, SyncJob, SyncPreparation, days_since_epoch
     # Claim before any network call. An expired lease recovers crashed workers;
     # write_started remains durable across crashes and forces read-only recovery.
     lease = secrets.token_hex(16)
@@ -99,7 +103,7 @@ def process(meal_id, force=False):
         if not force:
             filters += [SyncJob.state.in_(ACTIVE), SyncJob.next_attempt <= now()]
         claimed = db.execute(update(SyncJob).where(*filters).values(
-            lease=lease, lease_until=now() + timedelta(minutes=5)))
+            lease=lease, lease_until=now() + timedelta(minutes=15)))
         db.commit()
         if claimed.rowcount != 1:
             return
@@ -121,13 +125,26 @@ def process(meal_id, force=False):
                 return
             else:
                 if not job.food_ready:
-                    food_id, serving_id = fatsecret.create_exact_food(
-                        **credentials, name=meal.name, calories=meal.calories,
-                        protein=meal.protein, carbs=meal.carbs, fat=meal.fat,
-                        fiber=meal.fiber, sugar=meal.sugar)
+                    try:
+                        food_id, serving_id = fatsecret.create_exact_food(
+                            **credentials, name=meal.name, calories=meal.calories,
+                            protein=meal.protein, carbs=meal.carbs, fat=meal.fat,
+                            fiber=meal.fiber, sugar=meal.sugar)
+                        prepared = SyncPreparation(meal_id=meal.id, units=1, mode="custom")
+                    except fatsecret.FatSecretAPIError as exc:
+                        if exc.code not in {"10", "14", "HTTP403"}:
+                            raise
+                        match = fatsecret.find_catalog_fallback(
+                            consumer_key=credentials["consumer_key"], consumer_secret=credentials["consumer_secret"],
+                            name=meal.name, calories=meal.calories, protein=meal.protein, carbs=meal.carbs, fat=meal.fat)
+                        food_id, serving_id = match.food_id, match.serving_id
+                        prepared = SyncPreparation(meal_id=meal.id, units=match.number_of_units,
+                                                   mode="catalog", catalog_name=match.display_name[:200])
                     meal.fatsecret_food_id, meal.fatsecret_serving_id = food_id, serving_id
+                    db.merge(prepared)
                     job.food_ready = True
                     db.commit()
+                prepared = db.get(SyncPreparation, meal.id)
                 # Commit this BEFORE posting. Even a process crash cannot cause
                 # an automatic duplicate diary write after restart.
                 job.write_started, job.state = True, "writing"
@@ -136,11 +153,13 @@ def process(meal_id, force=False):
                     meal.fatsecret_entry_id = fatsecret.post_diary_entry(
                         **credentials, food_id=meal.fatsecret_food_id,
                         serving_id=meal.fatsecret_serving_id,
+                        number_of_units=prepared.units if prepared else 1,
                         food_entry_name=f"{meal.name[:160]} [CB:{job.marker}]",
                         meal=meal.meal_type, date_int=days_since_epoch(meal.eaten_at))
-                except fatsecret.FatSecretAPIError:
-                    # An explicit API rejection is a known failed write.
-                    job.write_started = False
+                except fatsecret.FatSecretAPIError as exc:
+                    # Provider timeouts/system errors may follow an accepted write.
+                    if exc.code not in {"1", "20", "24"}:
+                        job.write_started = False
                     raise
                 except (fatsecret.FatSecretError, requests.RequestException):
                     # Missing ID, malformed response or timeout: look for marker.
@@ -152,8 +171,19 @@ def process(meal_id, force=False):
             job.state, job.verified_at = "retrying", None
             job.error = "FatSecret is not connected. Reconnect from the dashboard; sync will resume."
         except fatsecret.FatSecretAPIError as exc:
-            job.state = "retrying" if exc.code in {"6", "7", "12", "HTTP429"} else "blocked"
-            job.error = str(exc) + ("; reconnect/check API permissions." if job.state == "blocked" else "; will retry.")
+            temporary = exc.code in {"1", "6", "7", "11", "12", "20", "24", "HTTP429"}
+            job.state = ("verifying" if job.write_started else "retrying") if temporary else "blocked"
+            explanations = {
+                "10": "Unknown API method; both documented request formats were rejected. Check method availability, not login.",
+                "9": "Invalid access token; reconnect FatSecret from the dashboard.",
+                "13": "Invalid OAuth token; check FatSecret authentication.",
+                "14": "Required API scope is missing; check application permissions.",
+                "21": "FatSecret rejected the request's IP address; check allowed IPs.",
+                "HTTP403": "HTTP access denied; check application permissions.",
+            }
+            detail = explanations.get(exc.code, "Will retry safely." if temporary else "Request rejected; inspect this API operation and configuration.")
+            operation = f" during {exc.operation}" if exc.operation else ""
+            job.error = f"{exc}{operation}: {detail}"
             job.verified_at = None
         except (fatsecret.FatSecretError, requests.RequestException) as exc:
             job.state = "verifying" if job.write_started else "retrying"

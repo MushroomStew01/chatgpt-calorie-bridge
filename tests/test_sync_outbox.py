@@ -115,10 +115,11 @@ def test_readback_mismatch_never_reports_success_or_deletes_user_data(env, chang
     assert post.call_count == 1
 
 
-def test_permission_failure_is_blocked_and_visible_without_duplicate_meal(env):
+def test_permission_failure_is_blocked_and_visible_without_duplicate_meal(env, monkeypatch):
     client, custom, post, _ = env
     meal_id = add(client)
-    custom.side_effect = fatsecret.FatSecretAPIError(13)
+    custom.side_effect = fatsecret.FatSecretAPIError('HTTP403')
+    monkeypatch.setattr(fatsecret, 'find_catalog_fallback', Mock(side_effect=fatsecret.FatSecretAPIError('HTTP403')))
     sync.process(meal_id)
     assert job_state(meal_id) == 'blocked'
     result = client.get(f'/api/meals/{meal_id}/verification', headers=HEADERS).json()
@@ -226,3 +227,73 @@ def test_queue_and_meal_rollback_together(env, monkeypatch):
         add(client)
     with main.SessionLocal() as db:
         assert db.scalar(select(func.count(main.Meal.id))) == 0
+
+
+@pytest.mark.parametrize('code,description', [
+    (10, 'Unknown API method'), (9, 'Invalid access token'),
+    (13, 'Invalid OAuth token'), (14, 'scope is missing'), (21, 'IP address'),
+])
+def test_error_codes_report_actual_cause(env, monkeypatch, code, description):
+    client, custom, post, _ = env
+    meal_id = add(client)
+    error = fatsecret.FatSecretAPIError(code)
+    error.operation = 'food.create.v2'
+    custom.side_effect = error
+    monkeypatch.setattr(fatsecret, 'find_catalog_fallback', Mock(side_effect=error))
+    sync.process(meal_id)
+    result = client.get(f'/api/meals/{meal_id}/verification', headers=HEADERS).json()
+    assert result['fatsecret']['status'] == 'blocked'
+    assert description in result['fatsecret']['error']
+    assert 'food.create.v2' in result['fatsecret']['error']
+    assert post.call_count == 0
+
+
+@pytest.mark.parametrize('code', [1, 20, 24])
+def test_provider_error_after_possible_write_only_reconciles(env, code):
+    client, _, post, read = env
+    meal_id = add(client)
+    post.side_effect = fatsecret.FatSecretAPIError(code)
+    sync.process(meal_id)
+    assert job_state(meal_id) == 'verifying'
+    read.return_value = [entry(meal_id)]
+    sync.process(meal_id, force=True)
+    assert job_state(meal_id) == 'verified'
+    assert post.call_count == 1
+
+
+@pytest.mark.parametrize('code', [6, 7, 11, 12, 'HTTP429'])
+def test_explicit_rate_or_nonce_rejection_can_retry_without_duplicate(env, code):
+    client, _, post, read = env
+    meal_id = add(client)
+    post.side_effect = fatsecret.FatSecretAPIError(code)
+    sync.process(meal_id)
+    assert job_state(meal_id) == 'retrying'
+    post.side_effect = None
+    read.return_value = [entry(meal_id)]
+    sync.process(meal_id, force=True)
+    assert job_state(meal_id) == 'verified'
+    assert post.call_count == 2  # The first request was explicitly rejected.
+
+
+def test_catalog_fallback_preserves_calories_and_persists_scaled_units(env, monkeypatch):
+    from types import SimpleNamespace
+    client, custom, post, read = env
+    meal_id = add(client)
+    custom.side_effect = fatsecret.FatSecretAPIError(10)
+    catalog = Mock(return_value=SimpleNamespace(food_id='100',serving_id='200',
+        number_of_units=2.125,display_name='Multigrain chips'))
+    monkeypatch.setattr(fatsecret,'find_catalog_fallback',catalog)
+    read.return_value = [entry(meal_id)]
+    sync.process(meal_id)
+    assert job_state(meal_id) == 'verified'
+    assert post.call_args.kwargs['number_of_units'] == 2.125
+    with main.SessionLocal() as db:
+        prepared=db.get(main.SyncPreparation,meal_id)
+        assert prepared.mode == 'catalog'
+        assert prepared.units == 2.125
+        result=sync.status(db, db.get(main.Meal,meal_id))
+        assert result['fatsecret']['nutrition_mode']=='catalog'
+        assert 'macros may differ' in result['fatsecret']['nutrition_note']
+        assert db.get(main.Meal,meal_id).calories == 300
+    sync.process(meal_id,force=True)
+    assert post.call_count == catalog.call_count == 1

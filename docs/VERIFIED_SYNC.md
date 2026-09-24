@@ -1,6 +1,6 @@
 # Verified FatSecret syncing
 
-Tracker 1.7.0 and MCP adapter 1.1.0 must be deployed together. Earlier deployed
+Tracker 1.7.1 and MCP adapter 1.1.0 must be deployed together. Earlier deployed
 branches used catalog search and a one-shot background task. Merging a fix in
 GitHub does not change a running Docker container.
 
@@ -8,8 +8,11 @@ GitHub does not change a running Docker container.
 
 The meal and a sync job commit in the same database transaction. A worker scans
 the durable queue every five seconds and resumes after a restart. It creates a
-custom food containing the supplied calories and macros; no catalog food match
-is required. Food and serving IDs are persisted before the diary POST.
+custom food containing the supplied calories and macros. If custom creation is
+unavailable (method/scope/access rejection), it selects a matching generic catalog
+food and scales the serving to the logged calories. Food and serving IDs, units,
+and preparation mode are persisted before the diary POST. Catalog macros may
+differ; the status response exposes this distinction.
 
 Before that POST, the worker commits `write_started` and embeds a stable random
 correlation marker in the diary name. After the POST it independently reads
@@ -64,16 +67,20 @@ alone. Health checks prove the new code is running, **not** that FatSecret accep
 a meal. Check an authorized meal through `getMealSyncStatus` afterward. No test
 meal is injected by deployment.
 
-The new `fatsecret_sync_jobs` table is additive; existing meal columns are unchanged.
+The `fatsecret_sync_jobs` and `fatsecret_sync_preparations` tables are additive;
+existing meal columns are unchanged.
 Use one Uvicorn worker on the Pi (the supplied Dockerfiles do). Atomic expiring
 leases also prevent two outbox workers from posting the same job concurrently.
 
 ## Provider limitations
 
-FatSecret must be connected and the account's API app must have `food.create.v2`
-permission (documented as Premier Exclusive). An outage, permission denial or
-provider calorie rounding cannot be solved by claiming success or substituting
-an inaccurate catalog entry. These remain visible pending/blocked/review states.
+FatSecret must be connected. Custom creation is preferred but is not required
+when a suitable catalog food is available. A missing suitable match remains queued.
+An outage, diary access denial or provider calorie rounding cannot be solved by
+claiming success. These remain visible pending/blocked/review states.
+
+Unknown-method error 10 retries the documented RPC format once; it is not labeled
+as a login error. Other errors and uncertain writes do not trigger a second POST.
 
 Provider contracts checked:
 - https://platform.fatsecret.com/docs/v2/food.create
@@ -82,4 +89,5 @@ Provider contracts checked:
 
 Tests cover accepted-but-timed-out writes, response formats, delayed visibility,
 crash recovery, active leases, explicit rejections, calorie/date/identity mismatch,
-auth protection, transactional persistence, MCP idempotency and stale verification.
+auth protection, transactional persistence, MCP idempotency, stale verification,
+method-format fallback, catalog units persistence, rate limits and provider timeouts.

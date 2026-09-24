@@ -25,7 +25,7 @@ def test_health():
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["api_version"] == "1.7.0"
+    assert body["api_version"] == "1.7.1"
     assert body["fatsecret_keys_configured"] is False
     assert body["fatsecret_connected"] is False
     assert body["fatsecret_oauth_signer"] == "manual-rfc3986-hmac-sha1"

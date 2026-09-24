@@ -93,6 +93,14 @@ class FatSecretConnection(Base):
     )
 
 
+class SyncPreparation(Base):
+    __tablename__ = "fatsecret_sync_preparations"
+    meal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    units: Mapped[float] = mapped_column(Float, default=1)
+    mode: Mapped[str] = mapped_column(String(30), default="custom")
+    catalog_name: Mapped[str] = mapped_column(String(200), default="")
+
+
 class SyncJob(Base):
     __tablename__ = "fatsecret_sync_jobs"
     meal_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -121,7 +129,7 @@ async def lifespan(app):
         stop.set()
         thread.join(timeout=1)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.7.0", lifespan=lifespan)
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.7.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -286,7 +294,7 @@ def action_schema(base_url: str) -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.7.0",
+            "version": "1.7.1",
             "description": (
                 "Log meals and sync their exact calories to FatSecret when "
                 "connected, and retrieve daily calorie totals."
@@ -410,7 +418,7 @@ def action_schema(base_url: str) -> dict:
 def health(db: Session = Depends(db_session)):
     return {
         "status": "ok",
-        "api_version": "1.7.0",
+        "api_version": "1.7.1",
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
         "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",

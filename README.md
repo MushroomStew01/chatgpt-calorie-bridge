@@ -12,7 +12,7 @@ A small FastAPI service for the workflow:
 
 - `POST /api/meals` to store calories, protein, carbs, fat, fiber, and sugar.
 - `GET /api/meals` and `GET /api/summary` for meal history and daily totals.
-- Automatic FatSecret custom-food creation and exact-calorie diary sync when FatSecret is connected.
+- Automatic FatSecret custom-food creation, calorie-matched catalog fallback, and verified diary sync.
 - A password-protected mobile-friendly dashboard at `/`, including per-meal FatSecret sync status.
 - A configurable daily calorie goal (default: 2,000 kcal) with calories remaining.
 - Local-day handling using `America/Toronto` by default so late-night entries do not fall onto the wrong UTC date.
@@ -25,7 +25,8 @@ A small FastAPI service for the workflow:
 ## How verified FatSecret sync works
 
 The Pi saves the meal and a durable sync job together. A background worker creates
-a custom food with the supplied nutrition, posts one diary entry, and independently
+a custom food with the supplied nutrition (or a matching catalog food scaled to
+the supplied calories when custom creation is unavailable), posts one diary entry, and independently
 reads it back to check calories, date and identity. Only then is it marked verified.
 
 The queue survives restarts. Transient failures retry with backoff. Uncertain diary
@@ -42,10 +43,9 @@ Deploy the tracker and MCP adapter together with
 `bash scripts/pi-deploy-verified-sync.sh` from a fresh checkout on the Pi.
 See [verification, recovery and deployment details](docs/VERIFIED_SYNC.md).
 
-FatSecret must be connected and allow
-[`food.create.v2`](https://platform.fatsecret.com/docs/v2/food.create) (Premier
-Exclusive). Outages, denied permissions and provider rounding cannot be overcome
-by substituting inaccurate calories or claiming success.
+FatSecret must be connected. If custom creation is unavailable, catalog fallback
+preserves logged calories; catalog macros can differ from the Pi's estimates.
+Outages remain queued, and rounding mismatches require review rather than claiming success.
 
 ## Local run
 
