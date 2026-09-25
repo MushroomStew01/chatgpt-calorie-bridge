@@ -146,3 +146,9 @@ curl "http://localhost:8000/api/summary" \
 - FatSecret Consumer and access secrets are never returned by the API.
 - Secrets belong in environment variables or the private PostgreSQL connection record, never in the repository.
 - `.env`, SQLite databases, virtual environments, and Python caches are ignored by Git.
+
+## ChatGPT Work plugin
+
+For an additive MCP/OAuth adapter on the existing Raspberry Pi, see
+[ChatGPT Work setup](docs/CHATGPT_WORK.md). It keeps the existing REST API,
+dashboard, database, and FatSecret workflow in place.
