@@ -10,6 +10,17 @@ from sqlalchemy import select, update, or_
 from app import fatsecret
 
 ACTIVE = ("pending", "retrying", "verifying", "writing")
+MISMATCH_PREFIX = "FatSecret diary mismatch: "
+MISMATCH_FIELDS = {"calories", "date_int", "meal", "food_id", "serving_id"}
+
+
+def mismatch_fields(job):
+    # Persist only fixed field names in the existing error column; never echo
+    # provider payloads, URLs, tokens, or arbitrary strings in diagnostics.
+    if not job or not (job.error or "").startswith(MISMATCH_PREFIX):
+        return []
+    return [name for name in job.error[len(MISMATCH_PREFIX):].split(", ")
+            if name in MISMATCH_FIELDS]
 
 
 class NotConnected(fatsecret.FatSecretError):
@@ -42,9 +53,11 @@ def status(db, meal):
         "verified_at": job.verified_at.isoformat() if job and job.verified_at else None,
         "error": job.error if job else "Legacy entry has not been verified by the new sync worker.",
         "attempts": job.attempts if job else 0,
+        "mismatch_fields": mismatch_fields(job),
+        "calorie_tolerance_kcal": 0.5 if prepared and prepared.mode == "catalog" and meal.calories > 0 else 0,
         "nutrition_mode": prepared.mode if prepared else "custom",
         "catalog_food": prepared.catalog_name if prepared and prepared.mode == "catalog" else None,
-        "nutrition_note": "Calories verified against the Pi; catalog macros may differ." if prepared and prepared.mode == "catalog" and job.state == "verified" else None,
+        "nutrition_note": "Calories verified within 0.5 kcal of the Pi; catalog macros may differ." if prepared and prepared.mode == "catalog" and job.state == "verified" else None,
     }}
 
 
@@ -59,7 +72,7 @@ def auth(db):
 
 
 def reconcile(db, meal, job, credentials):
-    from app.main import days_since_epoch
+    from app.main import days_since_epoch, SyncPreparation
     entries = fatsecret.read_diary_entries(**credentials, date_int=days_since_epoch(meal.eaten_at))
     marker = f"[CB:{job.marker}]"
     matches = [e for e in entries if (
@@ -80,15 +93,23 @@ def reconcile(db, meal, job, credentials):
     if not entry_id.isdigit() or int(entry_id) <= 0:
         raise fatsecret.FatSecretError("Diary read-back returned an invalid entry id")
     meal.fatsecret_entry_id = entry_id
-    valid = (
-        fatsecret._decimal(entry.get("calories")) == fatsecret._decimal(meal.calories)
-        and str(entry.get("date_int")) == str(days_since_epoch(meal.eaten_at))
-        and str(entry.get("meal", "")).lower() == meal.meal_type
-        and (not meal.fatsecret_food_id or str(entry.get("food_id")) == meal.fatsecret_food_id)
-        and (not meal.fatsecret_serving_id or str(entry.get("serving_id")) == meal.fatsecret_serving_id)
-    )
+    prepared = db.get(SyncPreparation, meal.id)
+    actual_calories = fatsecret._decimal(entry.get("calories"))
+    expected_calories = fatsecret._decimal(meal.calories)
+    calorie_ok = (fatsecret.catalog_calories_match(actual_calories, expected_calories)
+                  if prepared and prepared.mode == "catalog"
+                  else actual_calories == expected_calories)
+    checks = {
+        "calories": calorie_ok,
+        "date_int": str(entry.get("date_int")) == str(days_since_epoch(meal.eaten_at)),
+        "meal": str(entry.get("meal", "")).lower() == meal.meal_type,
+        "food_id": not meal.fatsecret_food_id or str(entry.get("food_id")) == meal.fatsecret_food_id,
+        "serving_id": not meal.fatsecret_serving_id or str(entry.get("serving_id")) == meal.fatsecret_serving_id,
+    }
+    mismatches = [field for field, matches in checks.items() if not matches]
+    valid = not mismatches
     job.state = "verified" if valid else "needs_review"
-    job.error = "" if valid else "FatSecret diary calories, date, meal or food differ from the saved meal."
+    job.error = "" if valid else MISMATCH_PREFIX + ", ".join(mismatches)
     job.verified_at = now() if valid else None
 
 
@@ -145,6 +166,8 @@ def process(meal_id, force=False):
                     job.food_ready = True
                     db.commit()
                 prepared = db.get(SyncPreparation, meal.id)
+                if prepared and prepared.mode == "catalog" and meal.calories == 0:
+                    raise fatsecret.FatSecretError("Zero-calorie catalog write avoided")
                 # Commit this BEFORE posting. Even a process crash cannot cause
                 # an automatic duplicate diary write after restart.
                 job.write_started, job.state = True, "writing"

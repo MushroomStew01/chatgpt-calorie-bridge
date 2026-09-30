@@ -16,6 +16,7 @@ import requests
 from app.fatsecret_match import (
     FatSecretMatch,
     choose_best_match,
+    catalog_calories_match,
     detailed_food_from_response,
     search_foods_from_response,
 )
@@ -390,7 +391,9 @@ def find_best_food_match(
 
 def find_catalog_fallback(*, name, calories, protein, carbs, fat, consumer_key, consumer_secret):
     """Use a related scalable catalog food; diary read-back remains authoritative."""
-    clean = re.split(r"\s+(?:with|—|–)\s+|\(", name, maxsplit=1, flags=re.I)[0].strip()
+    if _decimal(calories) == 0:
+        raise FatSecretError("Zero-calorie meals require an exact custom food; catalog write avoided")
+    clean = re.split(r"\s+(?:with|-|-)\s+|\(", name, maxsplit=1, flags=re.I)[0].strip()
     clean = re.sub(r"\b(?:most|slice|slices|portion|eaten|large|small)\b", "", clean, flags=re.I).strip()
     queries = [name, clean]
     if "sunchips" in name.lower().replace(" ", ""):
@@ -403,7 +406,8 @@ def find_catalog_fallback(*, name, calories, protein, carbs, fat, consumer_key, 
         match = find_best_food_match(consumer_key=consumer_key, consumer_secret=consumer_secret,
             query=query, calories=calories, protein=protein, carbs=carbs, fat=fat,
             max_search_results=20, max_detail_candidates=6, generic_only=True)
-        if match and match.score >= 0.32 and match.food_type.lower() == "generic":
+        if (match and match.score >= 0.32 and match.food_type.lower() == "generic"
+                and catalog_calories_match(match.predicted_calories, calories)):
             return match
     raise FatSecretError("No related scalable catalog food found; local meal is safe")
 

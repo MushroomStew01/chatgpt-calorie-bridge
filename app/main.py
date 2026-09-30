@@ -129,7 +129,7 @@ async def lifespan(app):
         stop.set()
         thread.join(timeout=1)
 
-app = FastAPI(title="ChatGPT Calorie Bridge", version="1.7.1", lifespan=lifespan)
+app = FastAPI(title="ChatGPT Calorie Bridge", version="1.7.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
@@ -294,7 +294,7 @@ def action_schema(base_url: str) -> dict:
         "openapi": "3.1.0",
         "info": {
             "title": "Calorie Bridge",
-            "version": "1.7.1",
+            "version": "1.7.2",
             "description": (
                 "Log meals and sync their exact calories to FatSecret when "
                 "connected, and retrieve daily calorie totals."
@@ -418,7 +418,7 @@ def action_schema(base_url: str) -> dict:
 def health(db: Session = Depends(db_session)):
     return {
         "status": "ok",
-        "api_version": "1.7.1",
+        "api_version": "1.7.2",
         "fatsecret_keys_configured": fatsecret_keys_configured(),
         "fatsecret_connected": fatsecret_connected(db),
         "fatsecret_oauth_signer": "manual-rfc3986-hmac-sha1",

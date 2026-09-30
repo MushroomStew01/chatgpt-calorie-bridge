@@ -197,3 +197,31 @@ def test_photo_meal_rejects_low_calorie_brand_and_uses_scalable_generic():
     assert match.food_type == "Generic"
     assert match.number_of_units == 2.0
     assert match.predicted_calories == 950.0
+
+
+def test_zero_target_cannot_select_positive_catalog_serving():
+    food = {"food_id": "1", "food_name": "Tea", "food_type": "Generic",
+            "servings": {"serving": [
+                {"serving_id": "10", "calories": "0", "number_of_units": "1"},
+                {"serving_id": "11", "calories": "100", "number_of_units": "1"}]}}
+    assert choose_best_match("Tea", [food], lambda _: food, target_calories=0) is None
+
+
+def test_prediction_uses_quantized_portion():
+    food = {"food_id": "1", "food_name": "Rice", "food_type": "Generic",
+            "servings": {"serving": {"serving_id": "10", "calories": "333", "number_of_units": "1"}}}
+    match = choose_best_match("Rice", [food], lambda _: food, target_calories=750)
+    assert match.number_of_units == 2.2523
+    assert abs(match.predicted_calories - 750.0159) < 1e-9
+
+
+def test_catalog_calorie_policy_is_absolute_finite_and_zero_exact():
+    from app.fatsecret_match import catalog_calories_match
+    assert catalog_calories_match("750.5", "750")
+    assert catalog_calories_match("749.5", "750")
+    assert not catalog_calories_match("750.5001", "750")
+    assert not catalog_calories_match("749.4999", "750")
+    assert not catalog_calories_match("0.01", "0")
+    assert catalog_calories_match("0", "0")
+    for invalid in ("NaN", "Infinity", "-1", "invalid"):
+        assert not catalog_calories_match(invalid, "750")

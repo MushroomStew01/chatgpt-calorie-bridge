@@ -29,10 +29,11 @@ The existing `calorie-bridge-app` must be running on localhost port 8021.
 Docker, Tailscale Funnel and the dashboard password must already be configured.
 Ports 8023 and 8443 must be free. The installer stops if either is occupied.
 
-From a separate checkout of this branch:
+For a new MCP installation, use a separate checkout of the reviewed main branch
+(after the verified-sync change has merged):
 
 ```bash
-git clone --branch work-plugin-mcp --single-branch \
+git clone --branch main --single-branch \
   https://github.com/MushroomStew01/chatgpt-calorie-bridge.git \
   "$HOME/calorie-work-mcp-source"
 bash "$HOME/calorie-work-mcp-source/scripts/pi-install-work-mcp.sh"
@@ -71,7 +72,16 @@ total first. That verifies read access without adding a meal. Then use the usual
 | --- | --- |
 | `getDailySummary` | Actual daily totals; omitted date means today in Toronto |
 | `getMeals` | Up to 50 meals for a Toronto day, newest first; flags possible truncation |
-| `logMeal` | Saves one meal through the existing API and queues its existing FatSecret sync |
+| `logMeal` | Saves one meal, queues sync, and checks FatSecret verification separately |
+| `getMealSyncStatus` | Re-reads an existing meal's FatSecret entry without another diary write |
+| `retryMealSync` | Requeues an existing job after configuration repair; uncertain writes remain read-only |
+
+The source versions are tracker 1.7.2, MCP adapter 1.1.0 and plugin instructions
+0.7.0. Existing installations should use the coordinated, backup-aware
+[upgrade procedure](VERIFIED_SYNC.md), not rerun the new-install script.
+A `verified` catalog entry permits up to 0.5 kcal absolute difference; custom
+foods and zero-calorie verification remain exact. Status identifies mismatch
+fields without exposing provider payloads.
 
 `logMeal` requires a unique request_id for each intended meal. Repeating the same
 ID and details returns the saved response, without another POST. Different

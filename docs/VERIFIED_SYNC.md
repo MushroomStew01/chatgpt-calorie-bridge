@@ -1,6 +1,8 @@
 # Verified FatSecret syncing
 
-Tracker 1.7.1 and MCP adapter 1.1.0 must be deployed together. Earlier deployed
+This source provides tracker 1.7.2, MCP adapter 1.1.0 and plugin instructions 0.7.0.
+Upgrade the tracker and MCP adapter together using the procedure below. These
+source versions do not establish what is currently deployed. Earlier deployed
 branches used catalog search and a one-shot background task. Merging a fix in
 GitHub does not change a running Docker container.
 
@@ -28,6 +30,27 @@ diary; a failed check clears old verification. It never creates a diary entry.
 The MCP adapter exposes these as `getMealSyncStatus` and `retryMealSync` and checks
 verification itself after `logMeal`, including cached idempotent responses.
 
+## Catalog calorie precision policy
+
+Catalog portions are rounded to four decimal places before nutrition is predicted.
+A candidate whose resulting calories differ by more than **0.5 kcal absolute**
+is rejected before the diary POST. Read-back uses the same maximum absolute
+difference for catalog entries only, accommodating whole-kcal display rounding.
+This is an application acceptance policy, not a guarantee about FatSecret's
+serialization. It does not grow with meal size. Values outside the bound still
+require review; custom-food calories still require exact equality.
+
+Zero-calorie meals require an exact custom food. If custom creation is unavailable,
+they remain retrying locally without a catalog diary POST. A previously prepared
+zero-calorie catalog job is also prevented from posting. Existing attempted writes
+remain read-only reconciliation jobs.
+
+Date, meal, food ID and serving ID checks remain strict (meal case is normalized;
+no undocumented aliases are accepted). Status includes `calorie_tolerance_kcal`
+and `mismatch_fields` with fixed names such as `calories` or `serving_id`.
+No provider response bodies, signed URLs or tokens appear in those diagnostics.
+A mismatch is not evidence of its cause until the failed field is known.
+
 ## States and recovery
 
 - `pending`: durable job is waiting for the worker.
@@ -54,7 +77,13 @@ read-back verification.
 
 ## Deployment
 
-From a fresh checkout of the reviewed branch on the Pi:
+For an existing installation with both `calorie-bridge-app` and
+`calorie-work-mcp`, use a fresh checkout of the reviewed commit on the Pi.
+The script requires the existing MCP container and its persistent config/data.
+For a fresh installation, first follow [Raspberry Pi setup](RASPBERRY_PI.md),
+then [MCP installation](CHATGPT_WORK.md). Existing MCP state must not be deleted.
+
+From the checkout:
 
 ```bash
 bash scripts/pi-deploy-verified-sync.sh
@@ -62,7 +91,8 @@ bash scripts/pi-deploy-verified-sync.sh
 
 The script backs up the database, environment and running source, builds both
 images, preserves the existing Compose project/database volume and actual MCP
-config/data mounts, and checks both service versions. It leaves Funnel routing
+config/data mounts, and checks both service versions. The tracker health check uses its existing
+Docker-published host port, including nondefault configurations. It leaves Funnel routing
 alone. Health checks prove the new code is running, **not** that FatSecret accepted
 a meal. Check an authorized meal through `getMealSyncStatus` afterward. No test
 meal is injected by deployment.

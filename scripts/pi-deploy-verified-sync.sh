@@ -6,6 +6,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="$HOME/calorie-sync-backup-$(date +%Y%m%d-%H%M%S)"
 sudo -v
 OLD_DIR="$(sudo docker inspect calorie-bridge-app --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')"
+HOST_PORT="$(sudo docker port calorie-bridge-app 8000/tcp | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert len(lines)==1; port=int(lines[0].rsplit(":",1)[1]); assert 1<=port<=65535; print(port)')"
 PROJECT="$(sudo docker inspect calorie-bridge-app --format '{{index .Config.Labels "com.docker.compose.project"}}')"
 test -n "$PROJECT"
 test -f "$OLD_DIR/.env.pi"
@@ -49,7 +50,7 @@ run_adapter() {
 "${compose[@]}" up -d --no-deps app
 ready=0
 for attempt in {1..30}; do
-  if curl -fsS --max-time 3 http://127.0.0.1:8021/health | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["api_version"]=="1.7.1" and x["fatsecret_sync_mode"]=="durable-outbox-readback"' 2>/dev/null; then ready=1; break; fi
+  if curl -fsS --max-time 3 "http://127.0.0.1:${HOST_PORT}/health" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert x["api_version"]=="1.7.2" and x["fatsecret_sync_mode"]=="durable-outbox-readback"' 2>/dev/null; then ready=1; break; fi
   sleep 2
 done
 if [ "$ready" != 1 ]; then
@@ -78,6 +79,6 @@ if [ "$ready" != 1 ]; then
   echo "New adapter failed health check; previous adapter restored. Backup: $BACKUP_DIR" >&2
   exit 1
 fi
-echo "Tracker 1.7.1 and MCP 1.1.0 are running. Backup: $BACKUP_DIR"
+echo "Tracker 1.7.2 and MCP 1.1.0 are running. Backup: $BACKUP_DIR"
 echo 'Next: log/check a meal and confirm FatSecret status is verified. Service health alone does not prove FatSecret delivery.'
 echo 'Older unsynced meals need diary review before retrying; they are not blindly replayed.'

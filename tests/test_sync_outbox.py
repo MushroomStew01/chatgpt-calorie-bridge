@@ -9,6 +9,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app import main, fatsecret, sync
 
+REAL_PROVIDER_FUNCTIONS = {name: getattr(fatsecret, name) for name in (
+    "create_exact_food", "post_diary_entry", "read_diary_entries", "find_best_food_match")}
+
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -297,3 +301,91 @@ def test_catalog_fallback_preserves_calories_and_persists_scaled_units(env, monk
         assert db.get(main.Meal,meal_id).calories == 300
     sync.process(meal_id,force=True)
     assert post.call_count == catalog.call_count == 1
+
+
+@pytest.mark.parametrize("target,base,override,state,posts,fields", [
+    (0, "333", {}, "retrying", 0, []),
+    (750, "333", {}, "verified", 1, []),
+    (750, "333", {"calories": "750.5"}, "verified", 1, []),
+    (750, "333", {"calories": "750.5001"}, "needs_review", 1, ["calories"]),
+    (750, "333", {"calories": "749.4999"}, "needs_review", 1, ["calories"]),
+    (750, "333", {"calories": "700"}, "needs_review", 1, ["calories"]),
+    (750, "333", {"meal": "snack"}, "needs_review", 1, ["meal"]),
+    (750, "333", {"serving_id": "0"}, "needs_review", 1, ["serving_id"]),
+    (750, "333", {"date_int": "1", "food_id": "999"}, "needs_review", 1, ["date_int", "food_id"]),
+    (0.001, "1000", {}, "retrying", 0, []),  # quantizes to zero units
+    (750, "100000", {}, "verified", 1, []),
+    (751, "100000", {}, "retrying", 0, []),  # units quantization loses 1 kcal
+])
+def test_real_catalog_worker_precision(env, monkeypatch, target, base, override, state, posts, fields):
+    """Exercise the real matcher, preparation, HTTP serialization and read-back."""
+    from decimal import Decimal
+    client, _, _, _ = env
+    for name, function in REAL_PROVIDER_FUNCTIONS.items():
+        monkeypatch.setattr(fatsecret, name, function)
+    writes = []
+    detail = {"food_id": "100", "food_name": "Chicken Fried Rice", "food_type": "Generic",
+              "servings": {"serving": [
+                  {"serving_id": "199", "calories": "0", "number_of_units": "1"},
+                  {"serving_id": "200", "calories": base, "number_of_units": "1"}]}}
+    def http(method, url, **kwargs):
+        data = kwargs.get("data", kwargs.get("params", {}))
+        if url == fatsecret.FOOD_CREATE_URL:
+            body = {"error": {"code": 14}}
+        elif url == fatsecret.SEARCH_URL:
+            body = {"foods": {"food": {"food_id": "100", "food_name": detail["food_name"], "food_type": "Generic"}}}
+        elif url == fatsecret.FOOD_GET_URL:
+            body = {"food": detail}
+        elif method == "POST" and url == fatsecret.DIARY_URL:
+            writes.append(data)
+            body = {"food_entry_id": "300"}
+        elif method == "GET" and url.endswith("/food-entries/v2"):
+            posted = writes[0]
+            body = {"food_entries": {"food_entry": entry(meal_id,
+                **{"calories": str(Decimal(base) * Decimal(str(posted["number_of_units"]))), **override})}}
+        else:
+            raise AssertionError((method, url))
+        return Mock(ok=True, status_code=200, json=Mock(return_value=body))
+    monkeypatch.setattr(requests, "get", lambda url, **kw: http("GET", url, **kw))
+    monkeypatch.setattr(requests, "post", lambda url, **kw: http("POST", url, **kw))
+    monkeypatch.setattr(requests, "delete", Mock(side_effect=AssertionError("No cleanup writes")))
+    response = client.post("/api/meals", headers=HEADERS, json={
+        "name": detail["food_name"], "calories": target, "eaten_at": "2026-09-23T00:30:00Z"})
+    assert response.status_code == 200
+    meal_id = response.json()["id"]
+    sync.process(meal_id)
+    assert job_state(meal_id) == state
+    assert len(writes) == posts
+    with main.SessionLocal() as db:
+        result = sync.status(db, db.get(main.Meal, meal_id))["fatsecret"]
+        assert result["mismatch_fields"] == fields
+    if posts:
+        if base == "333":
+            assert writes[0]["number_of_units"] == 2.2523
+        sync.process(meal_id, force=True)
+        assert len(writes) == 1
+
+
+def test_custom_food_keeps_exact_calorie_comparison(env):
+    client, _, _, read = env
+    meal_id = add(client)
+    read.return_value = [entry(meal_id, calories="300.01")]
+    sync.process(meal_id)
+    assert job_state(meal_id) == "needs_review"
+    with main.SessionLocal() as db:
+        result = sync.status(db, db.get(main.Meal, meal_id))["fatsecret"]
+        assert result["mismatch_fields"] == ["calories"]
+        assert result["calorie_tolerance_kcal"] == 0
+
+
+def test_old_prepared_zero_catalog_cannot_write(env):
+    client, _, post, _ = env
+    meal_id = add(client)
+    with main.SessionLocal() as db:
+        db.get(main.Meal, meal_id).calories = 0
+        db.get(main.SyncJob, meal_id).food_ready = True
+        db.add(main.SyncPreparation(meal_id=meal_id, units=1, mode="catalog", catalog_name="Tea"))
+        db.commit()
+    sync.process(meal_id)
+    assert job_state(meal_id) == "retrying"
+    post.assert_not_called()

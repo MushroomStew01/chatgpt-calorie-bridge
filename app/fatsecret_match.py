@@ -4,6 +4,7 @@ import math
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Optional
 
 
@@ -26,6 +27,23 @@ FILLER_WORDS = {
 # serving is far from the photo-derived calorie estimate, it is not a safe
 # candidate for automatic logging. Generic foods remain scalable.
 MAX_BRAND_CALORIE_ERROR_RATIO = 0.20
+
+# Application policy for catalog entries, not a claim about provider precision:
+# allow at most half a kcal (whole-kcal display rounding), never a percentage.
+# Zero remains exact; custom foods retain exact comparison in the worker.
+CATALOG_CALORIE_TOLERANCE = Decimal("0.5")
+
+
+def catalog_calories_match(actual: object, target: object) -> bool:
+    try:
+        actual, target = Decimal(str(actual)), Decimal(str(target))
+        if not actual.is_finite() or not target.is_finite() or min(actual, target) < 0:
+            return False
+        if target == 0:
+            return actual == 0
+        return abs(actual - target) <= CATALOG_CALORIE_TOLERANCE
+    except (InvalidOperation, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -150,6 +168,9 @@ def _best_serving_for_food(
     target_carbs: float,
     target_fat: float,
 ) -> Optional[tuple[dict[str, Any], float, float, float, float, float, float]]:
+    # Zero-calorie meals require an exact custom food, not a positive catalog portion.
+    if not math.isfinite(target_calories) or target_calories <= 0:
+        return None
     food_type = str(food.get("food_type") or "")
     best: Optional[tuple[dict[str, Any], float, float, float, float, float, float]] = None
 
@@ -186,10 +207,14 @@ def _best_serving_for_food(
             scale = 1.0
             number_of_units = 1.0
 
-        if number_of_units <= 0:
+        number_of_units = round(number_of_units, 4)
+        if not math.isfinite(number_of_units) or number_of_units <= 0:
             continue
-
+        # Predict from the actual serialized portion, not the unrounded ideal.
+        scale = number_of_units / base_units if is_generic else 1.0
         predicted_calories = base_calories * scale
+        if is_generic and not catalog_calories_match(predicted_calories, target_calories):
+            continue
         predicted_protein = safe_float(serving.get("protein")) * scale
         predicted_carbs = safe_float(serving.get("carbohydrate")) * scale
         predicted_fat = safe_float(serving.get("fat")) * scale
@@ -304,7 +329,7 @@ def choose_best_match(
             food_type=food_type,
             serving_description=str(serving.get("serving_description") or "serving"),
             score=round(total_score, 4),
-            predicted_calories=round(predicted_calories, 1),
+            predicted_calories=predicted_calories,
             predicted_protein=round(predicted_protein, 1),
             predicted_carbs=round(predicted_carbs, 1),
             predicted_fat=round(predicted_fat, 1),

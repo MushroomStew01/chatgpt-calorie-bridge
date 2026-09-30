@@ -6,7 +6,7 @@ For the Raspberry Pi phone-photo workflow, see [Mobile photo logging](docs/MOBIL
 
 A small FastAPI service for the workflow:
 
-`food photo → ChatGPT estimates nutrition → API logs meal → FatSecret exact-calorie sync → private web dashboard updates`
+`food photo → ChatGPT estimates nutrition → API logs meal → FatSecret verified calorie sync → private web dashboard updates`
 
 ## What it includes
 
@@ -28,6 +28,10 @@ The Pi saves the meal and a durable sync job together. A background worker creat
 a custom food with the supplied nutrition (or a matching catalog food scaled to
 the supplied calories when custom creation is unavailable), posts one diary entry, and independently
 reads it back to check calories, date and identity. Only then is it marked verified.
+Custom-food calories require exact equality. Catalog entries permit at most 0.5 kcal
+absolute difference under the [documented precision policy](docs/VERIFIED_SYNC.md).
+Zero-calorie meals require an exact custom food; they never fall back to a positive
+catalog portion.
 
 The queue survives restarts. Transient failures retry with backoff. Uncertain diary
 writes are reconciled using a stable marker, never blindly reposted. Missing API
@@ -142,7 +146,7 @@ curl -X POST "http://localhost:8000/api/meals" \
   }'
 ```
 
-When FatSecret is connected, the API queues exact-calorie sync automatically. Call `getMealSyncStatus` afterward: only `fatsecret.status=verified` confirms the diary entry and its calories. An entry ID alone is not confirmation.
+When FatSecret is connected, the API queues verified calorie sync automatically. Call `getMealSyncStatus` afterward: only `fatsecret.status=verified` confirms the diary entry and its calories. An entry ID alone is not confirmation.
 
 Get today's summary:
 

@@ -2,8 +2,8 @@
 
 This deployment removes the Render PostgreSQL dependency entirely. The Raspberry Pi runs both:
 
-- `calorie-bridge-app` — the FastAPI dashboard/API container
-- `calorie-bridge-db` — PostgreSQL 16 with a persistent Docker volume
+- `calorie-bridge-app` - the FastAPI dashboard/API container
+- `calorie-bridge-db` - PostgreSQL 16 with a persistent Docker volume
 
 Only the app is exposed publicly. PostgreSQL has **no host port** and is reachable only on the private Docker network.
 
@@ -54,6 +54,13 @@ The validation script checks:
 
 It redacts secret values, so its output is safe to send back for troubleshooting.
 
+## Upgrading an existing installation
+
+Follow [Verified sync deployment](VERIFIED_SYNC.md) from a fresh checkout of the
+reviewed commit. It updates tracker 1.7.2 and MCP adapter 1.1.0 with backups.
+The coordinated script requires an existing MCP container; an app-only installation
+must first follow [MCP installation](CHATGPT_WORK.md). Merging code does not deploy it.
+
 ## Useful commands
 
 ```bash
@@ -70,8 +77,10 @@ sudo docker compose --env-file .env.pi -f docker-compose.pi.yml restart
 
 # Update to latest GitHub code
 
-git pull --ff-only origin main
-sudo docker compose --env-file .env.pi -f docker-compose.pi.yml up -d --build
+# Existing tracker + MCP installation: use a fresh reviewed checkout and the
+# coordinated backup/upgrade procedure in docs/VERIFIED_SYNC.md.
+# Do not update only the tracker when the MCP adapter also needs upgrading.
+bash scripts/pi-deploy-verified-sync.sh
 
 # Tailscale Funnel status
 sudo tailscale funnel status
