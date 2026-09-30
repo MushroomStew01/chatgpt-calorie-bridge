@@ -2,8 +2,8 @@
 
 This deployment removes the Render PostgreSQL dependency entirely. The Raspberry Pi runs both:
 
-- `calorie-bridge-app` - the FastAPI dashboard/API container
-- `calorie-bridge-db` - PostgreSQL 16 with a persistent Docker volume
+- `calorie-bridge-app` — the FastAPI dashboard/API container
+- `calorie-bridge-db` — PostgreSQL 16 with a persistent Docker volume
 
 Only the app is exposed publicly. PostgreSQL has **no host port** and is reachable only on the private Docker network.
 

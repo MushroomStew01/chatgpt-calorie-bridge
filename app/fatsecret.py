@@ -393,7 +393,7 @@ def find_catalog_fallback(*, name, calories, protein, carbs, fat, consumer_key, 
     """Use a related scalable catalog food; diary read-back remains authoritative."""
     if _decimal(calories) == 0:
         raise FatSecretError("Zero-calorie meals require an exact custom food; catalog write avoided")
-    clean = re.split(r"\s+(?:with|-|-)\s+|\(", name, maxsplit=1, flags=re.I)[0].strip()
+    clean = re.split(r"\s+(?:with|—|–)\s+|\(", name, maxsplit=1, flags=re.I)[0].strip()
     clean = re.sub(r"\b(?:most|slice|slices|portion|eaten|large|small)\b", "", clean, flags=re.I).strip()
     queries = [name, clean]
     if "sunchips" in name.lower().replace(" ", ""):
