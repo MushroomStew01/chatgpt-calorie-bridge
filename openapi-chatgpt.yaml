@@ -1,64 +1,114 @@
 openapi: 3.1.0
 info:
   title: Calorie Bridge
-  version: 1.6.0
-  description: Log estimated meals immediately, queue FatSecret synchronization in the background when connected, and retrieve daily calorie totals.
+  version: 1.7.0
+  description: Log estimated meals immediately, queue FatSecret synchronization in
+    the background when connected, and retrieve daily calorie totals.
 servers:
-  - url: https://chatgpt-calorie-bridge.onrender.com
+- url: https://chatgpt-calorie-bridge.onrender.com
 paths:
   /api/meals:
     post:
       operationId: logMeal
       x-openai-isConsequential: false
-      summary: Log a meal immediately and queue FatSecret synchronization in the background when connected
+      summary: Log a meal immediately and queue FatSecret synchronization in the background
+        when connected
       security:
-        - ApiKeyAuth: []
+      - ApiKeyAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name, calories]
+              required:
+              - name
+              - calories
               properties:
-                name: { type: string }
-                calories: { type: number }
-                protein: { type: number, default: 0 }
-                carbs: { type: number, default: 0 }
-                fat: { type: number, default: 0 }
-                fiber: { type: number, default: 0 }
-                sugar: { type: number, default: 0 }
-                meal_type: { type: string, enum: [breakfast, lunch, dinner, other], default: other }
-                notes: { type: string, default: "" }
-                eaten_at: { type: string, format: date-time }
+                name:
+                  type: string
+                calories:
+                  type: number
+                protein:
+                  type: number
+                  default: 0
+                carbs:
+                  type: number
+                  default: 0
+                fat:
+                  type: number
+                  default: 0
+                fiber:
+                  type: number
+                  default: 0
+                sugar:
+                  type: number
+                  default: 0
+                meal_type:
+                  type: string
+                  enum:
+                  - breakfast
+                  - lunch
+                  - dinner
+                  - other
+                  default: other
+                notes:
+                  type: string
+                  default: ''
+                eaten_at:
+                  type: string
+                  format: date-time
                 fatsecret_search_query:
                   type: string
                   description: Legacy input; ignored by exact-calorie sync.
       responses:
-        "200": { description: Meal logged }
+        '200':
+          description: Meal logged
     get:
       operationId: getMeals
       summary: Get meals for one day; defaults to today
       security:
-        - ApiKeyAuth: []
+      - ApiKeyAuth: []
       parameters:
-        - in: query
-          name: day
-          schema: { type: string, format: date }
+      - in: query
+        name: day
+        schema:
+          type: string
+          format: date
       responses:
-        "200": { description: Meals }
+        '200':
+          description: Meals
   /api/summary:
     get:
       operationId: getDailySummary
       summary: Get daily calorie and macro totals
       security:
-        - ApiKeyAuth: []
+      - ApiKeyAuth: []
       parameters:
-        - in: query
-          name: day
-          schema: { type: string, format: date }
+      - in: query
+        name: day
+        schema:
+          type: string
+          format: date
       responses:
-        "200": { description: Daily summary }
+        '200':
+          description: Daily summary
+  /api/meals/{meal_id}/verification:
+    get:
+      operationId: getMealSyncStatus
+      summary: 'Mandatory after logging: verify Pi save and FatSecret status separately'
+      security:
+      - ApiKeyAuth: []
+      parameters:
+      - name: meal_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+      responses:
+        '200':
+          description: Only FatSecret status verified confirms sync
 components:
   schemas: {}
   securitySchemes:

@@ -56,13 +56,10 @@
             <td>{{ meal.carbs }}</td>
             <td>{{ meal.fat }}</td>
             <td>
-              {% if meal.fatsecret_entry_id %}
-                <span class="sync-state synced">Synced</span>
-              {% elif fatsecret_connected %}
-                <span class="sync-state local">Local only</span>
-              {% else %}
-                <span class="sync-state local">—</span>
-              {% endif %}
+              {% set sync = sync_states[meal.id] %}
+              <span class="sync-state {{ 'synced' if sync.status == 'verified' else 'local' }}">{{ sync.status|replace('_', ' ')|capitalize }}</span>
+              {% if sync.verified_at %}<div class="muted">Checked {{ sync.verified_at }}</div>{% endif %}
+              {% if sync.error %}<div class="muted">{{ sync.error }}</div>{% endif %}
             </td>
           </tr>
         {% endfor %}

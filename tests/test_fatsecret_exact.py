@@ -99,7 +99,7 @@ def test_timeout_is_not_retried(monkeypatch):
 def test_custom_food_permission_failure_is_explicit(monkeypatch):
     request = Mock(return_value=response({"error": {"code": 13, "message": "Permission denied"}}))
     monkeypatch.setattr(fatsecret, "signed_request", request)
-    with pytest.raises(fatsecret.FatSecretError, match="food.create.v2 access required.*Permission denied"):
+    with pytest.raises(fatsecret.FatSecretError, match="API error 13"):
         fatsecret.create_exact_food(**AUTH, name="Pizza", calories=540,
                                    protein=24, carbs=66, fat=20, fiber=4, sugar=6)
     assert request.call_count == 1

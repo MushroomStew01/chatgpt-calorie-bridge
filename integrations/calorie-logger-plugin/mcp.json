@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "calorie-pi": {
+      "type": "streamable-http",
+      "url": "https://stewytailscale.tail93bb57.ts.net/mcp"
+    }
+  }
+}
